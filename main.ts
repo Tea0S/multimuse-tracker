@@ -2011,7 +2011,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('General')
+			.setName('Polling and Paths')
 			.setHeading();
 
 		// Enable/Disable toggle
