@@ -2011,7 +2011,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Multimuse Tracker')
+			.setName('General')
 			.setHeading();
 
 		// Enable/Disable toggle
