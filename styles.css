@@ -17,3 +17,30 @@
 	border-top: none;
 }
 
+.multimuse-scene-context {
+	margin-bottom: 20px;
+	padding: 10px;
+	background: var(--background-modifier-border);
+	border-radius: 4px;
+}
+
+.multimuse-scene-context-title {
+	color: var(--text-normal);
+	font-size: 1.1em;
+}
+
+.multimuse-scene-location-desc {
+	margin-top: 10px;
+	margin-bottom: 15px;
+	color: var(--text-muted);
+}
+
+.multimuse-suggester-button,
+.multimuse-input {
+	width: 100%;
+}
+
+.multimuse-suggester-button {
+	margin: 5px 0;
+}
+

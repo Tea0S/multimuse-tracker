@@ -1,7 +1,7 @@
 {
-	"name": "multimuse-obsidian",
-	"version": "1.3.0",
-	"description": "Obsidian plugin for MultiMuse bot integration - track Discord threads and send messages as muses",
+	"name": "multimuse-tracker",
+	"version": "1.10.0",
+	"description": "MultiMuse bot integration for tracking Discord threads and sending messages as muses",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -15,11 +15,9 @@
 		"@types/node": "^16.11.6",
 		"@typescript-eslint/eslint-plugin": "5.29.0",
 		"@typescript-eslint/parser": "5.29.0",
-		"builtin-modules": "3.3.0",
-		"esbuild": "0.17.3",
+		"esbuild": "^0.28.0",
 		"obsidian": "latest",
 		"tslib": "2.4.0",
 		"typescript": "4.7.4"
 	}
 }
-

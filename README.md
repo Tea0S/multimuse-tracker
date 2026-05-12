@@ -1,4 +1,4 @@
-# Multimuse Obsidian
+# Multimuse Tracker
 For use with the BRAT Plugin for the best experiance.
 
 An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Track Discord roleplay threads, send messages as muses directly from Obsidian, and automatically sync scene states.
@@ -30,7 +30,7 @@ Install via [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) with https://
 
 ### 2. Configure Plugin
 
-1. Open Obsidian Settings → Multimuse Obsidian
+1. Open Obsidian Settings → Multimuse Tracker
 2. Paste your API key in the "API Key" field
 3. Your Discord user ID will be automatically detected from the API key
 4. Configure other settings:
@@ -209,4 +209,4 @@ MIT
 ## Credits
 
 - **Author**: BackstagePass Group
-- **Plugin**: Multimuse Obsidian
+- **Plugin**: Multimuse Tracker
