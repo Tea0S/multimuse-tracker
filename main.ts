@@ -183,6 +183,15 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		});
 
+		// First-time vault layout: scenes folder + Base (.base or .md) from settings
+		this.addCommand({
+			id: 'initialize-multimuse-workspace',
+			name: 'Initialize MultiMuse workspace',
+			callback: () => {
+				void this.initializeMultimuseWorkspace();
+			}
+		});
+
 		// Add command to insert Discord @ mention (guild members from Link property)
 		this.addCommand({
 			id: 'insert-mention',
@@ -1479,6 +1488,166 @@ export default class MultimuseObsidian extends Plugin {
 
 	// ========= BASE INTEGRATION =========
 
+	/** Ensure each segment of `folderPath` exists under the vault root. */
+	async ensureFolderPathExists(folderPath: string): Promise<void> {
+		const normalized = folderPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+		if (!normalized) return;
+		const parts = normalized.split('/').filter((p) => p.length > 0);
+		let acc = '';
+		for (const part of parts) {
+			acc = acc ? `${acc}/${part}` : part;
+			const existing = this.app.vault.getAbstractFileByPath(acc);
+			if (!existing) {
+				await this.app.vault.createFolder(acc);
+			}
+		}
+	}
+
+	/**
+	 * YAML for a native Obsidian Base listing scene notes under the scenes folder,
+	 * with columns aligned to MultiMuse frontmatter and plugin toggles.
+	 */
+	buildSceneBaseYaml(scenesFolder: string): string {
+		const folderLit = JSON.stringify(scenesFolder);
+		const lines: string[] = [
+			'# MultiMuse Tracker — generated Base (safe to edit in Obsidian)',
+			'filters:',
+			'  and:',
+			'    - file.ext == "md"',
+			`    - file.inFolder(${folderLit})`,
+		];
+		if (this.settings.trackIsActive) {
+			lines.push('    - \'note["Is Active?"] == true\'');
+		}
+		lines.push(
+			'properties:',
+			'  file.name:',
+			'    displayName: Scene',
+			'  file.path:',
+			'    displayName: Path',
+			'  Link:',
+			'    displayName: Link',
+			'  Characters:',
+			'    displayName: Characters',
+		);
+		if (this.settings.trackRoleplay) {
+			lines.push('  Roleplay:', '    displayName: Roleplay');
+		}
+		lines.push(
+			'  Participants:',
+			'    displayName: Participants',
+			"  'Replied?':",
+			'    displayName: Replied?',
+		);
+		if (this.settings.trackIsActive) {
+			lines.push("  'Is Active?':", '    displayName: Is Active?');
+		}
+		lines.push(
+			'  Created:',
+			'    displayName: Created',
+			'views:',
+			'  - type: table',
+			'    name: Roleplay Tracker',
+			'    order:',
+			'      - file.name',
+			'      - Link',
+			'      - Characters',
+		);
+		if (this.settings.trackRoleplay) {
+			lines.push('      - Roleplay');
+		}
+		lines.push(
+			'      - Participants',
+			"      - 'Replied?'",
+		);
+		if (this.settings.trackIsActive) {
+			lines.push("      - 'Is Active?'");
+		}
+		lines.push('      - Created');
+		return lines.join('\n') + '\n';
+	}
+
+	/** Starter markdown table compatible with this plugin's markdown Base integration. */
+	buildMarkdownTrackerStub(): string {
+		return [
+			'# MultiMuse scene tracker',
+			'',
+			'Rows below are appended when you create or sync scenes if **Obsidian Base Path** points to this file.',
+			'',
+			'| Scene | Characters | Link | Participants | Replied? |',
+			'|-------|------------|------|--------------|----------|',
+			'',
+		].join('\n');
+	}
+
+	/**
+	 * Create the configured scenes folder (if missing), then a new Base or markdown tracker file.
+	 * If **Obsidian Base Path** is empty, creates `<Scenes Folder>/Roleplay Tracker.base` and saves that path.
+	 */
+	async initializeMultimuseWorkspace(): Promise<void> {
+		const scenesFolder = this.settings.scenesFolder
+			.trim()
+			.replace(/\\/g, '/')
+			.replace(/^\/+|\/+$/g, '');
+		if (!scenesFolder) {
+			new Notice('Set Scenes Folder in Multimuse Tracker settings first.');
+			return;
+		}
+
+		const configuredBase = this.settings.basePath
+			.trim()
+			.replace(/\\/g, '/')
+			.replace(/^\/+|\/+$/g, '');
+
+		let targetBasePath: string;
+		if (!configuredBase) {
+			targetBasePath = `${scenesFolder}/Roleplay Tracker.base`;
+		} else {
+			targetBasePath = configuredBase;
+		}
+
+		const ext = (targetBasePath.split('.').pop() || '').toLowerCase();
+		if (ext !== 'base' && ext !== 'md') {
+			new Notice('Obsidian Base Path must end in .base or .md, or leave it empty to create Roleplay Tracker.base under your scenes folder.');
+			return;
+		}
+
+		try {
+			await this.ensureFolderPathExists(scenesFolder);
+
+			const existing = this.app.vault.getAbstractFileByPath(targetBasePath);
+			if (existing) {
+				new Notice(`Already exists: ${targetBasePath}. Remove it or change Obsidian Base Path in settings, then run again.`);
+				return;
+			}
+
+			const parent = targetBasePath.includes('/')
+				? targetBasePath.slice(0, targetBasePath.lastIndexOf('/'))
+				: '';
+			if (parent) {
+				await this.ensureFolderPathExists(parent);
+			}
+
+			const body = ext === 'base'
+				? this.buildSceneBaseYaml(scenesFolder)
+				: this.buildMarkdownTrackerStub();
+
+			await this.app.vault.create(targetBasePath, body);
+
+			this.settings.basePath = targetBasePath;
+			await this.saveSettings();
+
+			new Notice(
+				ext === 'base'
+					? `Created Base and set path: ${targetBasePath}`
+					: `Created markdown tracker and set path: ${targetBasePath}`,
+			);
+		} catch (error) {
+			console.error('[MultimuseObsidian] initializeMultimuseWorkspace:', error);
+			new Notice(`Could not initialize workspace: ${getErrorMessage(error)}`);
+		}
+	}
+
 	async addSceneToBase(file: TFile, frontmatter: FrontmatterData): Promise<void> {
 		/**Add scene to Obsidian Base with characters as variables.*/
 		if (!this.settings.basePath) return;
@@ -2061,7 +2230,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Obsidian Base Path')
-			.setDesc('Path to your Obsidian Base file (e.g., "RP Scenes/Roleplay Tracker.base" or "RP Scenes/Tracker.md")')
+			.setDesc('Path to your Obsidian Base file (e.g., "RP Scenes/Roleplay Tracker.base" or "RP Scenes/Tracker.md"). Leave empty and run **Initialize MultiMuse workspace** to create `<Scenes Folder>/Roleplay Tracker.base`.')
 			.addText(text => text
 				.setPlaceholder('RP Scenes/Roleplay Tracker.base')
 				.setValue(this.plugin.settings.basePath)

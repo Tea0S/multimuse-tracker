@@ -16,7 +16,10 @@ An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Trac
 
 ## Installation
 
-### Manual Installation
+Install via the Obsidian plugin library 
+
+
+OR
 
 Install via [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) with https://github.com/BackstagePassGroup/multimuse-obsidian
 
@@ -33,13 +36,27 @@ Install via [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) with https://
 1. Open Obsidian Settings → Multimuse Tracker
 2. Paste your API key in the "API Key" field
 3. Your Discord user ID will be automatically detected from the API key
-4. Configure other settings:
-   - **Enable Polling**: Turn automatic checking on/off
-   - **Poll Interval**: How often to check for new replies (5-60 minutes)
-   - **Scenes Folder**: Folder containing your scene files (default: "RP Scenes")
-   - **Obsidian Base Path**: Optional path to Base file for scene tracking
-   - **Track Roleplay Property**: Automatically extract "Roleplay" from folder path
-   - **Track Is Active? Property**: Automatically add "Is Active?" property (defaults to true)
+4. Adjust paths and property toggles if you want something other than the defaults:
+   - **Scenes Folder**: Where scene notes live (default: `RP Scenes`)
+   - **Track Roleplay Property** / **Track Is Active? Property**: Match how you want new scenes to get frontmatter (defaults on)
+   - **Obsidian Base Path**: Optional. Leave empty for first-time setup (see below), or set to a `.base` or `.md` file you already use
+   - **Enable Polling** / **Poll Interval**: How often threads are checked
+
+### 3. First-time vault layout (recommended)
+
+Use a single command to create your scenes folder and a Base aligned with your settings:
+
+1. Open the Command Palette and run **Initialize MultiMuse workspace**
+2. The plugin will:
+   - Create your **Scenes Folder** in the vault if it does not exist yet
+   - If **Obsidian Base Path** is empty, create `<Scenes Folder>/MultiMuse Scenes.base` (native Obsidian Base) and save that path in settings
+   - If **Obsidian Base Path** is set to a path ending in `.base` or `.md` that does not exist yet, create that file instead and keep the path as configured
+
+**Native `.base` file:** The generated Base lists markdown files under your scenes folder, filters to **Is Active?** = true when that property toggle is on, and shows columns for `Link`, `Characters`, optional `Roleplay` / `Is Active?`, `Participants`, `Replied?`, and `Created`. Requires an Obsidian version that supports **Bases**.
+
+**Markdown `.md` tracker:** If your Base path ends in `.md`, the command creates a starter pipe table. The plugin can append rows to that table when you create or sync scenes (it does not edit `.base` files programmatically; use the Base UI for those).
+
+You can run **Initialize MultiMuse workspace** again only after removing or renaming the target file, or after changing **Obsidian Base Path**.
 
 ## Usage
 
@@ -100,6 +117,7 @@ Created: 2024-01-15
 
 ## Commands
 
+- **Initialize MultiMuse workspace**: Create your **Scenes Folder** and a Base (`.base`) or markdown tracker (`.md`) from settings; sets **Obsidian Base Path** when you start with it empty
 - **Check Discord Threads Now**: Manually trigger a check for all scenes
 - **Toggle Discord Polling**: Enable/disable automatic polling
 - **Create New Scene**: Create a new scene file with muse selection

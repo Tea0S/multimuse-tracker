@@ -1,6 +1,6 @@
 {
 	"name": "multimuse-tracker",
-	"version": "1.10.1",
+	"version": "1.11.0",
 	"description": "MultiMuse bot integration for tracking Discord threads and sending messages as muses",
 	"main": "main.js",
 	"scripts": {
