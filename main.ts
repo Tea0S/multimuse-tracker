@@ -100,6 +100,10 @@ interface MuseWrappersResolveResponse {
 }
 
 const DISCORD_MESSAGE_BUDGET = 2000;
+/** Max wait for an in-flight poll to yield before posting (posts must not block on long polls). */
+const POLL_YIELD_MS = 600;
+/** Debounce vault modify/create handlers so autosave does not stack scene API calls. */
+const SCENE_CHANGE_DEBOUNCE_MS = 2500;
 
 /** Mirrors MultiMuse core/post_wrappers.compose_chunk_for_send (single-chunk Send as Muse). */
 function composeChunkForSend(
@@ -167,10 +171,12 @@ export default class MultimuseObsidian extends Plugin {
 	/** Bumped to cancel an in-flight poll when the user posts as muse (frees API for POST). */
 	pollGeneration = 0;
 	isPollRunning = false;
-	/** Resolves when the current poll batch finishes (Send as Muse awaits this). */
+	/** Resolves when the current poll batch finishes (Send as Muse only yields briefly). */
 	pollRunPromise: Promise<void> | null = null;
 	/** Serializes poll GETs so they do not stack many concurrent calls to the API host. */
 	private pollGetChain: Promise<void> = Promise.resolve();
+	/** Per-path debounce timers for vault scene modify/create (avoids API pile-up while editing). */
+	private sceneChangeDebounceTimers = new Map<string, number>();
 	museCache: Map<string, MuseInfo[]> = new Map(); // user_id (as string) -> muses
 	recentlyCreatedFiles: Set<string> = new Set(); // Track recently created files to skip immediate checking
 	// Cache of last-seen "Is Active?" value per scene path so we only sync when the user actually toggles it.
@@ -320,6 +326,10 @@ export default class MultimuseObsidian extends Plugin {
 
 	onunload() {
 		this.stopPolling();
+		for (const timerId of this.sceneChangeDebounceTimers.values()) {
+			window.clearTimeout(timerId);
+		}
+		this.sceneChangeDebounceTimers.clear();
 	}
 
 	async loadSettings() {
@@ -366,25 +376,35 @@ export default class MultimuseObsidian extends Plugin {
 		}
 	}
 
-	/** Serialize background GETs; POST waits for pollRunPromise then uses fast delivery. */
+	/** Serialize background GETs so they do not stack many concurrent calls to the API host. */
 	private enqueuePollGet<T>(fn: () => Promise<T>): Promise<T> {
 		const run = this.pollGetChain.then(() => fn());
 		this.pollGetChain = run.then((): void => undefined, (): void => undefined);
 		return run;
 	}
 
-	private async waitForPollToFinish(): Promise<void> {
+	/** Cancel in-flight poll work and drop queued poll GETs so Send as Muse can proceed. */
+	private prioritizePostOverPolling(): void {
 		this.pollGeneration++;
-		if (this.pollRunPromise) {
-			await this.pollRunPromise;
+		this.pollGetChain = Promise.resolve();
+	}
+
+	/** Brief yield for the current poll loop to exit; never block posts on a full poll batch. */
+	private async yieldPollSlot(maxWaitMs = POLL_YIELD_MS): Promise<void> {
+		this.prioritizePostOverPolling();
+		if (!this.pollRunPromise) {
+			return;
 		}
+		await Promise.race([
+			this.pollRunPromise.catch((): void => undefined),
+			new Promise<void>((resolve) => window.setTimeout(resolve, maxWaitMs)),
+		]);
 	}
 
 	private async apiPostJson(
 		path: string,
 		body: Record<string, unknown>
 	): Promise<RequestUrlResponse> {
-		await this.waitForPollToFinish();
 		return await requestUrl({
 			url: `${this.getBotApiUrl()}${path}`,
 			method: 'POST',
@@ -1023,43 +1043,46 @@ export default class MultimuseObsidian extends Plugin {
 
 
 	async handleSceneFileChange(file: TFile): Promise<void> {
-		/**Handle scene file creation/modification - scenes are auto-detected when queried, no registration needed.*/
+		/**Handle scene file creation/modification - debounced so autosave does not flood the API.*/
 		if (this.sceneCreationInProgress) {
 			return;
 		}
 
-		// Only process files in the scenes folder
 		if (!file.path.startsWith(this.settings.scenesFolder + '/')) {
 			return;
 		}
 
-		// Only process if enabled and API key is set
 		if (!this.settings.apiKey || !this.settings.enabled) {
 			return;
 		}
 
-		// Skip checking if this file was recently created by the plugin
 		if (this.recentlyCreatedFiles.has(file.path)) {
 			console.log(`[MultimuseObsidian] Skipping check for recently created file: ${file.path}`);
 			return;
 		}
 
-		// Small delay to avoid checking during file creation
-		await new Promise(resolve => window.setTimeout(resolve, 1000));
+		const existing = this.sceneChangeDebounceTimers.get(file.path);
+		if (existing !== undefined) {
+			window.clearTimeout(existing);
+		}
 
+		const timerId = window.setTimeout(() => {
+			this.sceneChangeDebounceTimers.delete(file.path);
+			void this.processSceneFileChange(file);
+		}, SCENE_CHANGE_DEBOUNCE_MS);
+		this.sceneChangeDebounceTimers.set(file.path, timerId);
+	}
+
+	private async processSceneFileChange(file: TFile): Promise<void> {
 		const cache = this.app.metadataCache.getFileCache(file);
 		if (this.getFrontmatter(cache)) {
-			// Sync Is Active? to the tracker so unchecking removes the scene from MultiMuse
 			await this.syncSceneActiveStatusToApi(file, cache);
-			// Sync Participants to the tracker so "your turn" / Replied? use the correct count
 			await this.syncSceneParticipantsToApi(file, cache);
 		}
 
-		// Query the scene state - this will auto-detect if it matches a tracked thread
 		try {
 			await this.querySceneState(file);
 		} catch (error) {
-			// Silently fail - don't spam errors for every file change
 			console.debug(`Error checking scene ${file.path}:`, error);
 		}
 	}
@@ -2403,69 +2426,81 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		let muses = this.museCache.get(primaryUserId) ?? [];
-		let matchedMuse = this.findMuseMatch(muses, selectedMuse);
-		if (!matchedMuse?.muse_id) {
-			muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
-			matchedMuse = this.findMuseMatch(muses, selectedMuse);
-		}
-
-		const icContent = selection.trim();
 		const postBody: Record<string, unknown> = {
 			thread_id: threadId,
 			muse_name: selectedMuse,
-			content: icContent,
+			content: selection.trim(),
 			user_id: primaryUserId,
 		};
-		if (matchedMuse?.muse_id) {
-			postBody.muse_id = matchedMuse.muse_id;
-		}
 
-		if (matchedMuse) {
-			const { header, footer } = await this.resolveMuseWrappers(
-				threadId,
-				primaryUserId,
-				matchedMuse,
-				selectedMuse
-			);
-			if ((header || footer) && canPreapplyWrappers(icContent, header, footer)) {
-				postBody.content = composeChunkForSend(icContent, header, footer);
-				postBody.wrappers_preapplied = true;
-			}
-		}
+		void this.deliverPostAsMuse(selectedMuse, primaryUserId, threadId, postBody);
+	}
 
-		// Return immediately; delivery runs in background (fast API accepts with 202).
-		void this.deliverPostAsMuse(selectedMuse, primaryUserId, postBody, !matchedMuse);
+	private async applyMuseWrappersToPost(
+		postBody: Record<string, unknown>,
+		threadId: string,
+		primaryUserId: string,
+		matchedMuse: MuseInfo,
+		selectedMuse: string
+	): Promise<void> {
+		const icRaw = typeof postBody.content === 'string' ? postBody.content : '';
+		const { header, footer } = await this.resolveMuseWrappers(
+			threadId,
+			primaryUserId,
+			matchedMuse,
+			selectedMuse
+		);
+		if ((header || footer) && canPreapplyWrappers(icRaw, header, footer)) {
+			postBody.content = composeChunkForSend(icRaw, header, footer);
+			postBody.wrappers_preapplied = true;
+		}
 	}
 
 	private async deliverPostAsMuse(
 		selectedMuse: string,
 		primaryUserId: string,
-		postBody: Record<string, unknown>,
-		retryOn403: boolean
+		threadId: string,
+		postBody: Record<string, unknown>
 	): Promise<void> {
 		try {
+			await this.yieldPollSlot();
+
+			let muses = this.museCache.get(primaryUserId) ?? [];
+			let matchedMuse = this.findMuseMatch(muses, selectedMuse);
+			if (!matchedMuse?.muse_id) {
+				muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
+				matchedMuse = this.findMuseMatch(muses, selectedMuse);
+			}
+			if (matchedMuse?.muse_id) {
+				postBody.muse_id = matchedMuse.muse_id;
+			}
+			if (matchedMuse) {
+				await this.applyMuseWrappersToPost(
+					postBody,
+					threadId,
+					primaryUserId,
+					matchedMuse,
+					selectedMuse
+				);
+			}
+
 			let response = await this.apiPostJson('/api/v1/messages/post', postBody);
 
-			if (response.status === 403 && retryOn403) {
-				const muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
-				const matchedMuse = this.findMuseMatch(muses, selectedMuse);
+			if (response.status === 403 && !matchedMuse) {
+				muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
+				matchedMuse = this.findMuseMatch(muses, selectedMuse);
 				if (matchedMuse) {
 					if (matchedMuse.muse_id) {
 						postBody.muse_id = matchedMuse.muse_id;
 					}
-					const icRaw = typeof postBody.content === 'string' ? postBody.content : '';
 					if (!postBody.wrappers_preapplied) {
-						const { header, footer } = await this.resolveMuseWrappers(
-							String(postBody.thread_id),
+						await this.applyMuseWrappersToPost(
+							postBody,
+							threadId,
 							primaryUserId,
 							matchedMuse,
 							selectedMuse
 						);
-						if ((header || footer) && canPreapplyWrappers(icRaw, header, footer)) {
-							postBody.content = composeChunkForSend(icRaw, header, footer);
-							postBody.wrappers_preapplied = true;
-						}
 					}
 					response = await this.apiPostJson('/api/v1/messages/post', postBody);
 				} else if (muses.length > 0) {
