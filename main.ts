@@ -540,10 +540,28 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	getFrontmatter(cache: CachedMetadata | null): FrontmatterData | null {
-		if (!cache?.frontmatter) {
-			return null;
+		return cache?.frontmatter ?? null;
+	}
+
+	private formatFrontmatterYaml(frontmatter: Record<string, FrontmatterValue>): string {
+		const lines = ['---'];
+		for (const key of Object.keys(frontmatter) as Array<keyof typeof frontmatter>) {
+			const value = frontmatter[key];
+			if (value === undefined) {
+				continue;
+			}
+			if (Array.isArray(value)) {
+				lines.push(`${String(key)}:`);
+				for (const item of value) {
+					lines.push(`  - ${item}`);
+				}
+			} else {
+				lines.push(`${String(key)}: ${value}`);
+			}
 		}
-		return cache.frontmatter as FrontmatterData;
+		lines.push('---');
+		lines.push('');
+		return lines.join('\n');
 	}
 
 	/**
@@ -1311,8 +1329,8 @@ export default class MultimuseObsidian extends Plugin {
 		const link = cache.frontmatter?.['Link'];
 		if (!link || typeof link !== 'string') return;
 
-		const frontmatter = cache.frontmatter as FrontmatterData;
-		if (!this.isSceneMarkedActive(frontmatter)) {
+		const frontmatter = cache.frontmatter;
+		if (!frontmatter || !this.isSceneMarkedActive(frontmatter)) {
 			return;
 		}
 
@@ -1694,21 +1712,7 @@ export default class MultimuseObsidian extends Plugin {
 			frontmatter['Is Active?'] = true;
 		}
 
-		const frontmatterLines = ['---'];
-		for (const [key, value] of Object.entries(frontmatter)) {
-			if (Array.isArray(value)) {
-				frontmatterLines.push(`${key}:`);
-				for (const item of value) {
-					frontmatterLines.push(`  - ${item}`);
-				}
-			} else {
-				frontmatterLines.push(`${key}: ${value}`);
-			}
-		}
-		frontmatterLines.push('---');
-		frontmatterLines.push('');
-
-		const content = frontmatterLines.join('\n');
+		const content = this.formatFrontmatterYaml(frontmatter);
 
 		// Ensure all folders in the path exist (create recursively)
 		const segs = location.split("/").filter(Boolean);
@@ -2549,11 +2553,10 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		// Poll Interval
 		new Setting(containerEl)
 			.setName('Poll Interval (minutes)')
-			.setDesc('How often to check for new replies')
+			.setDesc('How often to check for new replies (current value shown beside the slider)')
 			.addSlider(slider => slider
 				.setLimits(5, 60, 5)
 				.setValue(this.plugin.settings.pollInterval)
-				.setDynamicTooltip()
 				.onChange(async (value) => {
 					this.plugin.settings.pollInterval = value;
 					await this.plugin.saveSettings();
