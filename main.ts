@@ -60,6 +60,8 @@ interface SceneState {
 	timestamp?: string | null;
 	your_last_post?: string | null;
 	posted_since_count?: number | null;
+	initializing?: boolean;
+	source?: string;
 }
 
 interface SceneQueryResponse {
@@ -1116,14 +1118,23 @@ export default class MultimuseObsidian extends Plugin {
 		// Use replied or is_from_character (API may send either)
 		const repliedRaw = state.replied ?? state.is_from_character;
 		if (repliedRaw === undefined || repliedRaw === null) {
-			console.log(`[MultimuseObsidian] ${file.basename}: state.replied/is_from_character is undefined/null - skipping update`);
+			if (state.initializing) {
+				console.log(`[MultimuseObsidian] ${file.basename}: API still initializing turn state - skipping update`);
+			} else {
+				console.log(`[MultimuseObsidian] ${file.basename}: state.replied/is_from_character is undefined/null - skipping update`);
+			}
 			return false;
 		}
 
-		// Check if the state looks suspicious (e.g., bot couldn't access channel)
-		// If timestamp is null and your_last_post is null, it might indicate the bot couldn't read the channel
-		// In this case, don't update the Replied? field to avoid incorrect updates
-		if (state.timestamp === null && state.your_last_post === null && state.posted_since_count === 0) {
+		// Legacy guard for uninitialized in-memory state without thread_tracker anchors.
+		// thread_tracker responses include DB anchors or source=thread_tracker — trust those.
+		const fromThreadTracker = state.source === 'thread_tracker';
+		if (
+			!fromThreadTracker &&
+			state.timestamp === null &&
+			state.your_last_post === null &&
+			(state.posted_since_count ?? 0) === 0
+		) {
 			console.log(`[MultimuseObsidian] ${file.basename}: State appears invalid (timestamp and your_last_post are null) - likely bot can't access channel. Skipping update to prevent incorrect "Replied?" value.`);
 			return false;
 		}
