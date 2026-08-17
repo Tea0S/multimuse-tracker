@@ -197,7 +197,7 @@ Created: 2024-01-15
 ### "Send as Muse" not working
 - Use **Editing** view (pencil), not Reading view
 - Select the text first, then run the command (Command Palette, toolbar, or selection menu)
-- On mobile, add **Send as Muse** to the editor toolbar — it will not appear in that list until this plugin version (1.12.5+)
+- On mobile, add **Send as Muse** to the editor toolbar — it will not appear in that list until this plugin version (1.12.6+)
 - Verify the file has `Link` and `Characters` in frontmatter
 - Check that the selected muse exists and is accessible
 - Verify your API key is configured correctly

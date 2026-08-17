@@ -377,7 +377,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async loadSettings() {
-		const loaded = await this.loadData() as unknown;
+		const loaded: unknown = await this.loadData();
 		const savedSettings = loaded && typeof loaded === 'object'
 			? loaded as Partial<MultimuseObsidianSettings>
 			: {};
@@ -571,7 +571,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	private formatFrontmatterYaml(frontmatter: Record<string, FrontmatterValue>): string {
 		const lines = ['---'];
-		for (const key of Object.keys(frontmatter) as Array<keyof typeof frontmatter>) {
+		for (const key of Object.keys(frontmatter)) {
 			const value = frontmatter[key];
 			if (value === undefined) {
 				continue;
@@ -592,15 +592,11 @@ export default class MultimuseObsidian extends Plugin {
 
 	/**
 	 * Handle API response errors, especially authentication errors.
-	 * @param response The response object from requestUrl
-	 * @param context Context string for logging
-	 * @returns true if error was handled, false otherwise
+	 * @returns true if the error was handled (caller should stop), false otherwise
 	 */
-	handleApiError(response: RequestUrlResponse, context: string): boolean {
+	handleApiError(response: RequestUrlResponse, _context: string): boolean {
 		if (response.status === 401) {
-			const errorMsg = 'API authentication failed. Please check your API key in settings.';
-			console.error(`[MultimuseObsidian] ${context}: ${errorMsg}`);
-			new Notice(errorMsg);
+			new Notice('API authentication failed. Please check your API key in settings.');
 			return true;
 		}
 		return false;
@@ -643,12 +639,10 @@ export default class MultimuseObsidian extends Plugin {
 					return this.settings.cachedUserId;
 				}
 			} else {
-				if (!this.handleApiError(response, 'getUserIdFromApiKey')) {
-					console.error(`[MultimuseObsidian] Failed to get user ID from API: ${response.status}`);
-				}
+				this.handleApiError(response, 'getUserIdFromApiKey');
 			}
-		} catch (error) {
-			console.error('[MultimuseObsidian] Error fetching user ID from API key:', error);
+		} catch {
+			/* user ID comes from the API key; failure is shown when sending/polling */
 		}
 		
 		return null;
@@ -744,8 +738,7 @@ export default class MultimuseObsidian extends Plugin {
 				header: (data.header ?? '').trim(),
 				footer: (data.footer ?? '').trim(),
 			};
-		} catch (error) {
-			console.debug('[MultimuseObsidian] resolveMuseWrappers:', error);
+		} catch {
 			return { header: '', footer: '' };
 		}
 	}
@@ -762,9 +755,7 @@ export default class MultimuseObsidian extends Plugin {
 			headers: this.getApiHeaders()
 		});
 		if (response.status !== 200) {
-			if (!this.handleApiError(response, 'fetchMusesListFromApi')) {
-				console.error(`Failed to fetch muses: ${response.status} - ${response.text}`);
-			}
+			this.handleApiError(response, 'fetchMusesListFromApi');
 			return [];
 		}
 		const data = parseJson<MusesListResponse>(response.text);
@@ -787,12 +778,9 @@ export default class MultimuseObsidian extends Plugin {
 				return;
 			}
 
-			const muses = await this.fetchMusesListFromApi(userIds);
-			if (muses.length > 0) {
-				console.log(`[MultimuseObsidian] Synced ${muses.length} muse(s) for ${userIds.length} user(s)`);
-			}
-		} catch (error) {
-			console.error('Error syncing muses:', error);
+			await this.fetchMusesListFromApi(userIds);
+		} catch {
+			/* muse cache stays stale until the next successful sync */
 		}
 	}
 
@@ -842,9 +830,7 @@ export default class MultimuseObsidian extends Plugin {
 			}));
 
 			if (trackedResponse.status !== 200) {
-				if (!this.handleApiError(trackedResponse, 'checkAllThreadsViaBotApi')) {
-					console.error(`[MultimuseObsidian] Failed to fetch tracked threads: ${trackedResponse.status} - ${trackedResponse.text}`);
-				}
+				this.handleApiError(trackedResponse, 'checkAllThreadsViaBotApi');
 				return;
 			}
 
@@ -893,8 +879,8 @@ export default class MultimuseObsidian extends Plugin {
 						break;
 					}
 					await this.sleep(POLL_SCENE_DELAY_MS);
-				} catch (error) {
-					console.error(`Error checking tracked path ${scenePath}:`, error);
+				} catch {
+					/* continue remaining tracked scenes */
 				}
 			}
 
@@ -910,7 +896,6 @@ export default class MultimuseObsidian extends Plugin {
 						}
 
 						if (this.recentlyCreatedFiles.has(file.path)) {
-							console.log(`[MultimuseObsidian] checkAllThreadsViaBotApi: Skipping recently created file: ${file.path}`);
 							continue;
 						}
 
@@ -941,8 +926,8 @@ export default class MultimuseObsidian extends Plugin {
 							break;
 						}
 						await this.sleep(POLL_SCENE_DELAY_MS);
-					} catch (error) {
-						console.error(`Error checking ${file.path}:`, error);
+					} catch {
+						/* continue remaining vault scenes */
 					}
 				}
 			}
@@ -950,8 +935,8 @@ export default class MultimuseObsidian extends Plugin {
 			if (updatedCount > 0) {
 				new Notice(`Updated ${updatedCount} scene file(s)`);
 			}
-		} catch (error) {
-			console.error(`[MultimuseObsidian] Error checking all threads:`, error);
+		} catch {
+			/* poll cycle failed; next interval retries */
 		} finally {
 			if (generation === this.pollGeneration) {
 				this.isPollRunning = false;
@@ -1049,7 +1034,6 @@ export default class MultimuseObsidian extends Plugin {
 
 		// Skip checking if this file was recently created by the plugin
 		if (this.recentlyCreatedFiles.has(file.path)) {
-			console.log(`[MultimuseObsidian] querySceneState: Skipping check for recently created file: ${file.path}`);
 			return false;
 		}
 
@@ -1099,9 +1083,7 @@ export default class MultimuseObsidian extends Plugin {
 			}));
 
 			if (response.status !== 200) {
-				if (!this.handleApiError(response, `querySceneState for ${file.path}`)) {
-					console.error(`[MultimuseObsidian] API error for ${file.path}: ${response.status} - ${response.text}`);
-				}
+				this.handleApiError(response, `querySceneState for ${file.path}`);
 				return false;
 			}
 
@@ -1128,25 +1110,20 @@ export default class MultimuseObsidian extends Plugin {
 			
 			// If scene is not tracked, don't update anything
 			if (!data.tracked || !data.state) {
-				console.log(`[MultimuseObsidian] Scene ${file.basename} is not tracked (tracked: ${data.tracked}, has state: ${!!data.state}) - skipping update`);
 				return false;
 			}
 
 			const state = data.state;
 			// API may return 'replied' and/or 'is_from_character' (same meaning)
 			const repliedValue = state.replied ?? state.is_from_character;
-			console.log(`[MultimuseObsidian] Scene ${file.basename} is tracked. State:`, JSON.stringify(state), 'repliedValue=', repliedValue);
-			
-			// Only update if we have a definite replied value (replied or is_from_character)
+
 			if (repliedValue === undefined || repliedValue === null) {
-				console.log(`[MultimuseObsidian] Scene ${file.basename} has undefined/null replied value - skipping update`);
 				return false;
 			}
 			// Normalize state so updateSceneFromState sees a single field
 			const normalizedState = { ...state, replied: repliedValue };
 			return await this.updateSceneFromState(file, cache, normalizedState);
-		} catch (error) {
-			console.error(`[MultimuseObsidian] Error querying scene state for ${file.path}:`, error);
+		} catch {
 			return false;
 		}
 	}
@@ -1162,11 +1139,6 @@ export default class MultimuseObsidian extends Plugin {
 		// Use replied or is_from_character (API may send either)
 		const repliedRaw = state.replied ?? state.is_from_character;
 		if (repliedRaw === undefined || repliedRaw === null) {
-			if (state.initializing) {
-				console.log(`[MultimuseObsidian] ${file.basename}: API still initializing turn state - skipping update`);
-			} else {
-				console.log(`[MultimuseObsidian] ${file.basename}: state.replied/is_from_character is undefined/null - skipping update`);
-			}
 			return false;
 		}
 
@@ -1179,7 +1151,6 @@ export default class MultimuseObsidian extends Plugin {
 			state.your_last_post === null &&
 			(state.posted_since_count ?? 0) === 0
 		) {
-			console.log(`[MultimuseObsidian] ${file.basename}: State appears invalid (timestamp and your_last_post are null) - likely bot can't access channel. Skipping update to prevent incorrect "Replied?" value.`);
 			return false;
 		}
 
@@ -1190,11 +1161,7 @@ export default class MultimuseObsidian extends Plugin {
 		// true = you've replied (no need to reply), false = need to reply
 		const shouldBeReplied = repliedRaw === true || repliedRaw === 'true';
 
-		console.log(`[MultimuseObsidian] ${file.basename}: Current Replied?=${currentReplied}, API replied=${repliedRaw}, shouldBeReplied=${shouldBeReplied}`);
-
-		// Always apply API state so Replied? unchecks when someone replies back (your turn again)
 		if (currentReplied !== shouldBeReplied) {
-			console.log(`[MultimuseObsidian] ${file.basename}: Updated Replied? to ${shouldBeReplied}`);
 			await this.updateFrontmatter(file, 'Replied?', shouldBeReplied);
 			updated = true;
 		}
@@ -1224,7 +1191,6 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		if (this.recentlyCreatedFiles.has(file.path)) {
-			console.log(`[MultimuseObsidian] Skipping check for recently created file: ${file.path}`);
 			return;
 		}
 
@@ -1277,8 +1243,8 @@ export default class MultimuseObsidian extends Plugin {
 
 		try {
 			await this.querySceneState(file, { skipMetadataSync: true });
-		} catch (error) {
-			console.debug(`Error checking scene ${file.path}:`, error);
+		} catch {
+			/* scene query is best-effort after a local edit */
 		}
 	}
 
@@ -1338,11 +1304,10 @@ export default class MultimuseObsidian extends Plugin {
 				this.sceneActiveCache.set(file.path, isActive);
 				if (!isActive) {
 					this.clearSceneSyncCaches(file.path);
-					console.log(`[MultimuseObsidian] Synced Is Active?=false for ${file.path} - removed from tracker`);
 				}
 			}
-		} catch (e) {
-			console.debug(`[MultimuseObsidian] Could not sync Is Active? for ${file.path}:`, e);
+		} catch {
+			/* Is Active? sync is best-effort */
 		}
 	}
 
@@ -1389,7 +1354,6 @@ export default class MultimuseObsidian extends Plugin {
 				});
 				if (response.status === 200) {
 					this.sceneMetadataSyncCache.set(file.path, fingerprint);
-					console.debug(`[MultimuseObsidian] Synced scene metadata (source of truth) for ${file.path}`);
 				}
 				return;
 			}
@@ -1410,10 +1374,9 @@ export default class MultimuseObsidian extends Plugin {
 			});
 			if (response.status === 200) {
 				this.sceneMetadataSyncCache.set(file.path, fingerprint);
-				console.debug(`[MultimuseObsidian] Synced Participants=${participants} for ${file.path}`);
 			}
-		} catch (e) {
-			console.debug(`[MultimuseObsidian] Could not sync scene metadata for ${file.path}:`, e);
+		} catch {
+			/* metadata sync is best-effort */
 		}
 	}
 
@@ -1553,7 +1516,6 @@ export default class MultimuseObsidian extends Plugin {
 		const match = content.match(frontmatterRegex);
 		
 		if (!match) {
-			console.error(`[MultimuseObsidian] No frontmatter found in ${file.path}`);
 			return;
 		}
 
@@ -1645,8 +1607,6 @@ export default class MultimuseObsidian extends Plugin {
 			const queryParam = `user_ids=${userIds.join(',')}`;
 
 			const url = `${this.getBotApiUrl()}/api/v1/muses/list?${queryParam}`;
-			console.log(`[MultimuseObsidian] Fetching muses for ${userIds.length} user(s): ${userIds.join(', ')}`);
-			console.log(`[MultimuseObsidian] API URL: ${url}`);
 
 			const response = await requestUrl({
 				url: url,
@@ -1657,22 +1617,12 @@ export default class MultimuseObsidian extends Plugin {
 			if (response.status === 200) {
 				const data = parseJson<MusesListResponse>(response.text);
 				muses = data.muses || [];
-				console.log(`[MultimuseObsidian] Found ${muses.length} muse(s) from ${userIds.length} user(s)`);
-				if (muses.length > 0) {
-					const ownerIds = muses.map(m => m.owner_id);
-					const uniqueOwners = [...new Set(ownerIds)];
-					console.log(`[MultimuseObsidian] Muses from ${uniqueOwners.length} owner(s): ${uniqueOwners.join(', ')}`);
-					console.log(`[MultimuseObsidian] Muse names: ${muses.map(m => m.name).join(', ')}`);
-				}
 			} else {
-				if (!this.handleApiError(response, 'createNewScene - fetch muses')) {
-					console.error(`[MultimuseObsidian] API error: ${response.status} - ${response.text}`);
-					new Notice(`Failed to fetch muses: ${response.status}`);
-				}
+				this.handleApiError(response, 'createNewScene - fetch muses');
+				new Notice(`Failed to fetch muses: ${response.status}`);
 				return;
 			}
-		} catch (error) {
-			console.error('Error fetching muses:', error);
+		} catch {
 			new Notice('Failed to fetch muses from bot API. Check your API URL and connection.');
 			return;
 		}
@@ -1702,9 +1652,7 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		// 4) Get location (RP folder) - pass muse name for context
-		console.log(`[MultimuseObsidian] createNewScene: About to select location for muse "${selectedMuse.name}"`);
 		const location = await this.selectSceneLocation(`muse "${selectedMuse.name}"`);
-		console.log(`[MultimuseObsidian] createNewScene: Selected location: ${location || 'null (cancelled)'}`);
 		if (!location) return;
 
 		// 5) Get scene name
@@ -1767,16 +1715,10 @@ export default class MultimuseObsidian extends Plugin {
 		// Remove from the set after 60 seconds (enough time for the scene to be registered and settled with the API)
 		window.setTimeout(() => {
 			this.recentlyCreatedFiles.delete(filePath);
-			console.log(`[MultimuseObsidian] Removed ${filePath} from recently created files - will now be checked by polling`);
 		}, 60000);
 
 		// 8) Link the vault scene to the current Discord-side thread tracker.
 		try {
-			console.debug(`Tracking scene: threadId=${threadInfo.threadId}, guildId=${threadInfo.guildId}, channelId=${threadInfo.channelId}, url=${threadUrl}`);
-			
-			// Convert IDs to strings to avoid JavaScript number precision loss
-			// Discord IDs are larger than Number.MAX_SAFE_INTEGER, so we send them as strings
-			// Use primary user ID for thread tracking
 			const primaryUserId = await this.getPrimaryUserId();
 			if (!primaryUserId) {
 				new Notice('Failed to get user ID from API key. Please check your API key in settings.');
@@ -1792,8 +1734,6 @@ export default class MultimuseObsidian extends Plugin {
 				guildId: threadInfo.guildId || null,
 				isActive: true,
 			});
-			
-			console.debug(`Scene registration response: ${registerResponse.status} - ${registerResponse.text}`);
 
 			if (registerResponse.status === 200) {
 				this.sceneMetadataSyncCache.set(
@@ -1805,8 +1745,8 @@ export default class MultimuseObsidian extends Plugin {
 					if (this.settings.basePath) {
 						await this.addSceneToBase(createdFile, frontmatter);
 					}
-				} catch (baseError) {
-					console.error('Error adding to Base (non-fatal):', baseError);
+				} catch {
+					/* Base table update is optional */
 				}
 
 				new Notice(`Scene created: ${sceneName}`);
@@ -1816,17 +1756,10 @@ export default class MultimuseObsidian extends Plugin {
 				this.handleApiError(registerResponse, 'createNewScene - track thread');
 				new Notice('Scene created but failed to track with bot: Authentication failed. Check your API key.');
 			} else {
-				const errorText = registerResponse.text || 'Unknown error';
-				console.error(`Failed to track thread: ${registerResponse.status} - ${errorText}`);
 				new Notice(`Scene created but failed to track with bot: ${registerResponse.status}`);
 			}
 		} catch (error) {
-			// Log the full error for debugging
-			console.error('Error tracking thread:', error);
-			const errorMessage = getErrorMessage(error);
-			console.error('Error details:', errorMessage);
-			
-			new Notice(`Scene created but failed to track with bot: ${errorMessage}`);
+			new Notice(`Scene created but failed to track with bot: ${getErrorMessage(error)}`);
 		}
 	}
 
@@ -1987,7 +1920,6 @@ export default class MultimuseObsidian extends Plugin {
 					: `Created markdown tracker and set path: ${targetBasePath}`,
 			);
 		} catch (error) {
-			console.error('[MultimuseObsidian] initializeMultimuseWorkspace:', error);
 			new Notice(`Could not initialize workspace: ${getErrorMessage(error)}`);
 		}
 	}
@@ -2005,7 +1937,6 @@ export default class MultimuseObsidian extends Plugin {
 			// Skip .base files - they use a special format that we shouldn't modify directly
 			// Base plugin should handle its own format
 			if (baseFile.extension === 'base') {
-				console.log(`[MultimuseObsidian] Skipping Base integration for .base file - use Base plugin UI to add records`);
 				return;
 			}
 
@@ -2041,8 +1972,8 @@ export default class MultimuseObsidian extends Plugin {
 				const tableHeader = '| Scene | Characters | Link | Participants | Replied? |\n|-------|------------|------|--------------|----------|\n';
 				await this.app.vault.modify(baseFile, tableHeader + recordLine);
 			}
-		} catch (error) {
-			console.error('Error adding scene to Base:', error);
+		} catch {
+			/* markdown tracker table update is optional */
 		}
 	}
 
@@ -2120,10 +2051,8 @@ export default class MultimuseObsidian extends Plugin {
 			? `Select location for ${context}`
 			: 'Select scene location';
 		
-		console.log(`[MultimuseObsidian] selectSceneLocation: Showing ${options.length} options with title: ${suggesterTitle}`);
 		const choiceIndex = await this.showSuggester(options, options, suggesterTitle);
 		if (choiceIndex === null) {
-			console.log(`[MultimuseObsidian] selectSceneLocation: User cancelled or no selection`);
 			return null;
 		}
 
@@ -2195,7 +2124,7 @@ export default class MultimuseObsidian extends Plugin {
 						const match = this.titleText.match(/for (.+)$/);
 						if (match) {
 							const contextInfo = match[1];
-							const infoEl = contentEl.createEl('div', {
+							const infoEl = contentEl.createDiv({
 								cls: 'multimuse-scene-context'
 							});
 							infoEl.createEl('strong', { 
@@ -2209,7 +2138,7 @@ export default class MultimuseObsidian extends Plugin {
 						});
 					}
 
-					let firstButton: HTMLButtonElement | null = null;
+					let firstButton: HTMLElement | null = null;
 					this.items.forEach((item, index) => {
 						const button = contentEl.createEl('button', {
 							text: item,
@@ -2385,8 +2314,7 @@ export default class MultimuseObsidian extends Plugin {
 			}
 			const data = parseJson<GuildMembersResponse>(response.text);
 			members = data.members || [];
-		} catch (e) {
-			console.error('[MultimuseObsidian] insertMention fetch error:', e);
+		} catch {
 			new Notice('Failed to fetch server members. Check connection and API key.');
 			return;
 		}
@@ -2568,7 +2496,6 @@ export default class MultimuseObsidian extends Plugin {
 				new Notice(`Failed to send message: ${errorData.message || response.status}`);
 			}
 		} catch (error) {
-			console.error('Error sending message:', error);
 			new Notice(`Failed to send message: ${getErrorMessage(error)}`);
 		}
 	}
@@ -2582,50 +2509,149 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	/** 1.13.0+: Obsidian renders this and skips display(). Also indexes settings search. */
+	getSettingDefinitions() {
+		return [
+			{
+				name: 'Enable polling',
+				desc: 'Automatically check Discord threads for new replies',
+				render: (setting: Setting) => {
+					setting.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.enabled)
+						.onChange(value => void this.setPollingEnabled(value)));
+				},
+			},
+			{
+				name: 'Poll interval (minutes)',
+				desc: 'How often to check for new replies',
+				render: (setting: Setting) => {
+					setting.addSlider(slider => slider
+						.setLimits(5, 60, 5)
+						.setDynamicTooltip()
+						.setValue(this.plugin.settings.pollInterval)
+						.onChange(value => void this.setPollInterval(value)));
+				},
+			},
+			{
+				name: 'Scenes folder',
+				desc: 'Folder containing your scene files',
+				control: { type: 'text', key: 'scenesFolder', placeholder: 'RP Scenes' },
+			},
+			{
+				name: 'Obsidian Base path',
+				desc: 'Path to your Obsidian Base file (for example RP Scenes/Roleplay Tracker.base). Leave empty and use Initialize workspace to create one.',
+				control: { type: 'text', key: 'basePath', placeholder: 'RP Scenes/Roleplay Tracker.base' },
+			},
+			{
+				name: 'Initialize workspace',
+				desc: 'Create your scenes folder and tracker base from the paths above.',
+				action: () => {
+					void this.plugin.initializeMultimuseWorkspace();
+				},
+			},
+			{
+				type: 'group',
+				heading: 'Scene properties',
+				items: [
+					{
+						name: 'Track Roleplay property',
+						desc: 'Add a Roleplay property to new scene files from the selected folder name.',
+						control: { type: 'toggle', key: 'trackRoleplay' },
+					},
+					{
+						name: 'Track Is Active? property',
+						desc: 'Add an Is Active? property to new scene files (defaults to true).',
+						control: { type: 'toggle', key: 'trackIsActive' },
+					},
+					{
+						name: 'Obsidian as source of truth',
+						desc: 'Push Characters and Participants edits from scene frontmatter to MultiMuse using the thread id in Link.',
+						render: (setting: Setting) => {
+							setting.addToggle(toggle => toggle
+								.setValue(this.plugin.settings.obsidianSourceOfTruth)
+								.onChange(value => void this.setSourceOfTruth(value)));
+						},
+					},
+				],
+			},
+			{
+				name: 'API key',
+				desc: 'Generate one with /api generate in Discord DMs with the MultiMuse bot. Your user ID is detected from the key.',
+				render: (setting: Setting) => {
+					setting.addText(text => {
+						text.setPlaceholder('mm_...')
+							.setValue(this.plugin.settings.apiKey || '');
+						text.inputEl.setAttr('type', 'password');
+						text.onChange(value => void this.setApiKey(value));
+					});
+				},
+			},
+			{
+				name: 'Detected user ID',
+				desc: 'Your Discord user ID, detected from the API key.',
+				visible: () => !!this.plugin.settings.cachedUserId,
+				render: (setting: Setting) => {
+					setting.addText(text => {
+						text.setValue(this.plugin.settings.cachedUserId);
+						text.setDisabled(true);
+					});
+				},
+			},
+			{
+				name: 'Sync muses',
+				desc: 'Refresh muse names from the MultiMuse API.',
+				action: () => {
+					void this.plugin.syncMuses().then(() => new Notice('Muses synced!'));
+				},
+			},
+			{
+				name: 'Manual check',
+				desc: 'Check Discord threads now.',
+				action: () => {
+					void this.plugin.checkAllThreads({ force: true });
+					new Notice('Checking Discord threads...');
+				},
+			},
+			{
+				type: 'group',
+				heading: 'How it works',
+				items: [
+					{
+						name: 'Scene matching',
+						desc: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn.',
+					},
+					{
+						name: 'API key',
+						desc: 'Generate a key with /api generate in Discord DMs with the bot. Scenes are detected when queried; you do not register them by hand.',
+					},
+				],
+			},
+		];
+	}
+
 	display(): void {
 		const { containerEl } = this;
 
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Polling and Paths')
-			.setHeading();
-
-		// Enable/Disable toggle
-		new Setting(containerEl)
-			.setName('Enable Polling')
+			.setName('Enable polling')
 			.setDesc('Automatically check Discord threads for new replies')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.enabled)
-				.onChange(async (value) => {
-					this.plugin.settings.enabled = value;
-					await this.plugin.saveSettings();
-					if (value) {
-						this.plugin.startPolling();
-					} else {
-						this.plugin.stopPolling();
-					}
-				}));
+				.onChange(value => void this.setPollingEnabled(value)));
 
-		// Poll Interval
 		new Setting(containerEl)
-			.setName('Poll Interval (minutes)')
-			.setDesc('How often to check for new replies (current value shown beside the slider)')
+			.setName('Poll interval (minutes)')
+			.setDesc('How often to check for new replies')
 			.addSlider(slider => slider
 				.setLimits(5, 60, 5)
+				.setDynamicTooltip()
 				.setValue(this.plugin.settings.pollInterval)
-				.onChange(async (value) => {
-					this.plugin.settings.pollInterval = value;
-					await this.plugin.saveSettings();
-					if (this.plugin.settings.enabled) {
-						this.plugin.stopPolling();
-						this.plugin.startPolling();
-					}
-				}));
+				.onChange(value => void this.setPollInterval(value)));
 
-		// Scenes Folder
 		new Setting(containerEl)
-			.setName('Scenes Folder')
+			.setName('Scenes folder')
 			.setDesc('Folder containing your scene files')
 			.addText(text => text
 				.setPlaceholder('RP Scenes')
@@ -2636,8 +2662,8 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
-			.setName('Obsidian Base Path')
-			.setDesc('Path to your Obsidian Base file (e.g., "RP Scenes/Roleplay Tracker.base" or "RP Scenes/Tracker.md"). Leave empty and use **Initialize workspace** below to create `<Scenes Folder>/Roleplay Tracker.base`.')
+			.setName('Obsidian Base path')
+			.setDesc('Path to your Obsidian Base file (for example RP Scenes/Roleplay Tracker.base). Leave empty and use Initialize workspace to create one.')
 			.addText(text => text
 				.setPlaceholder('RP Scenes/Roleplay Tracker.base')
 				.setValue(this.plugin.settings.basePath)
@@ -2648,7 +2674,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Initialize workspace')
-			.setDesc('Create your scenes folder and tracker base from the paths above (or use **Initialize MultiMuse workspace** in the command palette).')
+			.setDesc('Create your scenes folder and tracker base from the paths above.')
 			.addButton(button => button
 				.setButtonText('Initialize')
 				.setCta()
@@ -2656,14 +2682,13 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 					void this.plugin.initializeMultimuseWorkspace();
 				}));
 
-		// Scene Properties Tracking
 		new Setting(containerEl)
-			.setName('Scene Properties')
+			.setName('Scene properties')
 			.setHeading();
 
 		new Setting(containerEl)
-			.setName('Track Roleplay Property')
-			.setDesc(`Automatically add "Roleplay" property to scene files based on the selected folder (e.g., "For The Greeks" from "${this.plugin.settings.scenesFolder}/For The Greeks/Twin Flames")`)
+			.setName('Track Roleplay property')
+			.setDesc('Add a Roleplay property to new scene files from the selected folder name.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.trackRoleplay)
 				.onChange(async (value) => {
@@ -2672,8 +2697,8 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
-			.setName('Track Is Active? Property')
-			.setDesc('Automatically add "Is Active?" property to new scene files (defaults to true)')
+			.setName('Track Is Active? property')
+			.setDesc('Add an Is Active? property to new scene files (defaults to true).')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.trackIsActive)
 				.onChange(async (value) => {
@@ -2683,98 +2708,103 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Obsidian as source of truth')
-			.setDesc('When enabled, edits to Characters and Participants in scene frontmatter are pushed to MultiMuse using the thread id from Link. Use this when you adjust muses or participant counts in Obsidian instead of Discord.')
+			.setDesc('Push Characters and Participants edits from scene frontmatter to MultiMuse using the thread id in Link.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.obsidianSourceOfTruth)
-				.onChange(async (value) => {
-					this.plugin.settings.obsidianSourceOfTruth = value;
-					this.plugin.sceneMetadataSyncCache.clear();
-					await this.plugin.saveSettings();
-				}));
+				.onChange(value => void this.setSourceOfTruth(value)));
 
-		// Bot API URL - Hidden from user for security (uses hardcoded default)
-		// Removed from settings UI to prevent exposing server IP address
-
-		// API Key (required for authentication)
 		new Setting(containerEl)
-			.setName('API Key')
-			.setDesc('Your Multimuse API key for authentication. Generate one using /api generate in Discord DMs with the bot. Your user ID will be automatically detected from the API key.')
+			.setName('API key')
+			.setDesc('Generate one with /api generate in Discord DMs with the MultiMuse bot. Your user ID is detected from the key.')
 			.addText(text => {
 				text.setPlaceholder('mm_...')
-					.setValue(this.plugin.settings.apiKey || '')
-					.inputEl.type = 'password';
-				text.onChange(async (value) => {
-					this.plugin.settings.apiKey = value.trim();
-					// Clear cached user ID when API key changes
-					this.plugin.settings.cachedUserId = '';
-					await this.plugin.saveSettings();
-					
-					// Auto-fetch user ID from API key
-					if (value.trim()) {
-						const userId = await this.plugin.getUserIdFromApiKey();
-						if (userId) {
-							new Notice(`User ID detected: ${userId}`);
-							await this.plugin.syncMuses();
-							if (this.plugin.settings.enabled) {
-								this.plugin.stopPolling();
-								this.plugin.startPolling();
-							}
-						} else {
-							new Notice('Failed to get user ID from API key. Please check your API key.');
-						}
-					}
-				});
+					.setValue(this.plugin.settings.apiKey || '');
+				text.inputEl.setAttr('type', 'password');
+				text.onChange(value => void this.setApiKey(value));
 			});
 
-		// Show cached user ID (read-only, for information)
 		if (this.plugin.settings.cachedUserId) {
 			new Setting(containerEl)
-				.setName('Detected User ID')
-				.setDesc(`Your Discord user ID (automatically detected from API key): ${this.plugin.settings.cachedUserId}`)
+				.setName('Detected user ID')
+				.setDesc(`Your Discord user ID, detected from the API key: ${this.plugin.settings.cachedUserId}`)
 				.addText(text => {
 					text.setValue(this.plugin.settings.cachedUserId);
-					text.inputEl.disabled = true;
+					text.setDisabled(true);
 				});
 		}
 
-		// Sync Muses button
 		new Setting(containerEl)
-			.setName('Sync Muses')
-			.setDesc('Manually sync muse names from bot API')
+			.setName('Sync muses')
+			.setDesc('Refresh muse names from the MultiMuse API.')
 			.addButton(button => button
-				.setButtonText('Sync Now')
+				.setButtonText('Sync now')
 				.setCta()
 				.onClick(async () => {
 					await this.plugin.syncMuses();
 					new Notice('Muses synced!');
 				}));
 
-		// Manual check button
 		new Setting(containerEl)
-			.setName('Manual Check')
-			.setDesc('Check Discord threads now')
+			.setName('Manual check')
+			.setDesc('Check Discord threads now.')
 			.addButton(button => button
-				.setButtonText('Check Now')
+				.setButtonText('Check now')
 				.setCta()
 				.onClick(() => {
 					void this.plugin.checkAllThreads({ force: true });
 					new Notice('Checking Discord threads...');
 				}));
 
-		// Info section
-		containerEl.createEl('hr');
-		const infoEl = containerEl.createEl('div');
-		new Setting(infoEl)
-			.setName('How It Works')
+		new Setting(containerEl)
+			.setName('How it works')
 			.setHeading();
-		infoEl.createEl('p', { text: 'This plugin queries the Multimuse API to check if your scene files match tracked threads and updates the "Replied?" field.' });
-		infoEl.createEl('p', { text: '• Scenes are matched by Link (thread id) and Characters properties' });
-		infoEl.createEl('p', { text: '• Use **Check Discord Threads Now** (or polling) to refresh Replied? — true = you replied, false = your turn' });
-		infoEl.createEl('p', { text: '• Enable **Obsidian as source of truth** to push Characters and Participants changes from frontmatter to the tracker' });
-		infoEl.createEl('p', { text: '• Make sure your scene files have a "Link" field (Discord thread URL) and "Characters" field (array) in frontmatter' });
-		infoEl.createEl('p', { text: '• Uses Multimuse API - requires an API key for authentication' });
-		infoEl.createEl('p', { text: '• Generate an API key using /api generate in Discord DMs with the bot' });
-		infoEl.createEl('p', { text: '• Scenes are auto-detected when queried - no manual registration needed' });
+		containerEl.createEl('p', { text: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn.' });
+		containerEl.createEl('p', { text: 'Generate an API key with /api generate in Discord DMs with the bot. Scenes are detected when queried; you do not register them by hand.' });
+	}
+
+	private async setPollingEnabled(value: boolean): Promise<void> {
+		this.plugin.settings.enabled = value;
+		await this.plugin.saveSettings();
+		if (value) {
+			this.plugin.startPolling();
+		} else {
+			this.plugin.stopPolling();
+		}
+	}
+
+	private async setPollInterval(value: number): Promise<void> {
+		this.plugin.settings.pollInterval = value;
+		await this.plugin.saveSettings();
+		if (this.plugin.settings.enabled) {
+			this.plugin.stopPolling();
+			this.plugin.startPolling();
+		}
+	}
+
+	private async setSourceOfTruth(value: boolean): Promise<void> {
+		this.plugin.settings.obsidianSourceOfTruth = value;
+		this.plugin.sceneMetadataSyncCache.clear();
+		await this.plugin.saveSettings();
+	}
+
+	private async setApiKey(value: string): Promise<void> {
+		this.plugin.settings.apiKey = value.trim();
+		this.plugin.settings.cachedUserId = '';
+		await this.plugin.saveSettings();
+		if (!value.trim()) {
+			return;
+		}
+		const userId = await this.plugin.getUserIdFromApiKey();
+		if (userId) {
+			new Notice(`User ID detected: ${userId}`);
+			await this.plugin.syncMuses();
+			if (this.plugin.settings.enabled) {
+				this.plugin.stopPolling();
+				this.plugin.startPolling();
+			}
+		} else {
+			new Notice('Failed to get user ID from API key. Please check your API key.');
+		}
 	}
 }
 
