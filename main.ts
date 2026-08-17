@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, CachedMetadata, RequestUrlResponse, Platform, Scope } from 'obsidian';
+import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope } from 'obsidian';
 
 interface MultimuseObsidianSettings {
 	botApiUrl: string; // Bot HTTP API URL (hidden from user UI for security)
@@ -213,6 +213,8 @@ export default class MultimuseObsidian extends Plugin {
 	sceneCreationInProgress = false;
 	/** Swallows Enter between wizard modals so it cannot reach the editor. */
 	sceneCreationKeymapScope: Scope | null = null;
+	/** Last non-empty editor selection — mobile toolbar taps often clear the live selection. */
+	private lastEditorSelection = '';
 
 	async onload() {
 		await this.loadSettings();
@@ -281,17 +283,33 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		});
 
-		// Add command to insert Discord @ mention (guild members from Link property)
+		// Editor commands (editorCallback + icon) so they appear on the mobile toolbar
 		this.addCommand({
 			id: 'insert-mention',
 			name: 'Insert @ mention',
-			callback: async () => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (!view) {
+			icon: 'at-sign',
+			editorCallback: (editor, ctx) => {
+				const file = this.resolveEditorFile(ctx);
+				if (!file) {
 					new Notice('Open a scene note (with Link in frontmatter) and try again.');
 					return;
 				}
-				await this.insertMentionAtCursor(view);
+				void this.insertMentionAtCursor(editor, file);
+			}
+		});
+
+		this.addCommand({
+			id: 'send-as-muse',
+			name: 'Send as Muse',
+			icon: 'message-square',
+			editorCallback: (editor, ctx) => {
+				this.rememberEditorSelection(editor);
+				const file = this.resolveEditorFile(ctx);
+				if (!file) {
+					new Notice('Open a scene note (with Link in frontmatter) and try again.');
+					return;
+				}
+				void this.sendSelectionAsMuse(editor, file);
 			}
 		});
 
@@ -312,30 +330,38 @@ export default class MultimuseObsidian extends Plugin {
 			})
 		);
 
-		// Add context menu items for scene editor
+		this.registerEvent(
+			this.app.workspace.on('editor-change', (editor) => {
+				this.rememberEditorSelection(editor);
+			})
+		);
+
+		// Selection menu (desktop right-click / mobile select overflow)
 		this.registerEvent(
 			this.app.workspace.on('editor-menu', (menu, editor, view) => {
+				this.rememberEditorSelection(editor);
 				menu.addItem((item) => {
 					item.setTitle('Insert @ mention')
 						.setIcon('at-sign')
 						.onClick(async () => {
-							if (view instanceof MarkdownView) {
-								await this.insertMentionAtCursor(view);
-							} else {
-								new Notice('This feature requires a markdown view.');
+							const file = this.resolveEditorFile(view);
+							if (!file) {
+								new Notice('Open a scene note (with Link in frontmatter) and try again.');
+								return;
 							}
+							await this.insertMentionAtCursor(editor, file);
 						});
 				});
 				menu.addItem((item) => {
 					item.setTitle('Send as Muse')
 						.setIcon('message-square')
 						.onClick(async () => {
-							// Type guard: ensure view is MarkdownView, not MarkdownFileInfo
-							if (view instanceof MarkdownView) {
-								await this.sendSelectionAsMuse(editor, view);
-							} else {
-								new Notice('This feature requires a markdown view.');
+							const file = this.resolveEditorFile(view);
+							if (!file) {
+								new Notice('Open a scene note (with Link in frontmatter) and try again.');
+								return;
 							}
+							await this.sendSelectionAsMuse(editor, file);
 						});
 				});
 			})
@@ -2274,16 +2300,55 @@ export default class MultimuseObsidian extends Plugin {
 		});
 	}
 
+	private resolveEditorFile(ctx: MarkdownView | MarkdownFileInfo): TFile | null {
+		if (ctx.file instanceof TFile) return ctx.file;
+		return this.app.workspace.getActiveViewOfType(MarkdownView)?.file ?? null;
+	}
+
+	private rememberEditorSelection(editor: Editor): void {
+		const sel = editor.getSelection() || this.getCmSelection(editor);
+		if (sel) this.lastEditorSelection = sel;
+	}
+
+	private getCmSelection(editor: Editor): string {
+		const cm = (editor as unknown as {
+			cm?: {
+				state?: {
+					sliceDoc?: (from: number, to: number) => string;
+					selection?: { main?: { from: number; to: number }; ranges?: { from: number; to: number }[] };
+				};
+			};
+		}).cm;
+		const state = cm?.state;
+		if (!state) return '';
+		const main = state.selection?.main ?? state.selection?.ranges?.[0];
+		if (!main || main.from === main.to) return '';
+		if (typeof state.sliceDoc === 'function') {
+			return state.sliceDoc(main.from, main.to);
+		}
+		return '';
+	}
+
+	/** Mobile toolbar taps often clear the visual selection before the command runs. */
+	private getEditorSelection(editor: Editor): string {
+		const live = editor.getSelection();
+		if (live) {
+			this.lastEditorSelection = live;
+			return live;
+		}
+		const fromCm = this.getCmSelection(editor);
+		if (fromCm) {
+			this.lastEditorSelection = fromCm;
+			return fromCm;
+		}
+		return this.lastEditorSelection;
+	}
+
 	/**
 	 * Fetch guild members from the bot API using guild_id from the current note's Link property,
 	 * then insert a Discord mention <@userId> at the cursor (or replace selection).
 	 */
-	async insertMentionAtCursor(view: MarkdownView): Promise<void> {
-		const file = view.file;
-		if (!file) {
-			new Notice('No active file.');
-			return;
-		}
+	async insertMentionAtCursor(editor: Editor, file: TFile): Promise<void> {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const frontmatter = this.getFrontmatter(cache);
 		if (!frontmatter) {
@@ -2342,7 +2407,6 @@ export default class MultimuseObsidian extends Plugin {
 		if (idx === null || idx < 0) return;
 		const chosen = sortedMembers[idx];
 		const mention = `<@${chosen.id}>`;
-		const editor = view.editor;
 		const sel = editor.getSelection();
 		if (sel) {
 			editor.replaceSelection(mention);
@@ -2352,19 +2416,11 @@ export default class MultimuseObsidian extends Plugin {
 		new Notice(`Inserted @${chosen.display_name || chosen.username}`);
 	}
 
-	async sendSelectionAsMuse(editor: Editor, view: MarkdownView): Promise<void> {
+	async sendSelectionAsMuse(editor: Editor, file: TFile): Promise<void> {
 		/**Send selected text as a muse to Discord thread from frontmatter properties.*/
-		// Get selected text
-		const selection = editor.getSelection();
+		const selection = this.getEditorSelection(editor);
 		if (!selection || selection.trim().length === 0) {
 			new Notice('No text selected. Please select text to send as muse.');
-			return;
-		}
-
-		// Get active file
-		const file = view.file;
-		if (!file) {
-			new Notice('No active file found.');
 			return;
 		}
 
@@ -2408,6 +2464,7 @@ export default class MultimuseObsidian extends Plugin {
 			selectedMuse = characters[museIndex];
 		}
 
+		this.lastEditorSelection = '';
 		new Notice(`Sending as ${selectedMuse}…`);
 
 		const primaryUserId = this.settings.cachedUserId || await this.getPrimaryUserId();

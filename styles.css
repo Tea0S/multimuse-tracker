@@ -42,5 +42,6 @@
 
 .multimuse-suggester-button {
 	margin: 5px 0;
+	min-height: 44px;
 }
 

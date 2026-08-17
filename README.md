@@ -6,7 +6,7 @@ An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Trac
 ## Features
 
 - ✅ **Automatic Thread Tracking**: Automatically tracks Discord threads linked in your scene files
-- ✅ **Send as Muse**: Right-click selected text to post as a muse to Discord threads
+- ✅ **Send as Muse**: Post selected text as a muse to Discord (command palette, mobile toolbar, or selection menu)
 - ✅ **Auto-Detected User ID**: Automatically detects your Discord user ID from your API key (no manual configuration needed)
 - ✅ **Scene Creation**: Create new scene files with muse selection, folder organization, and automatic property tracking
 - ✅ **Sync from Tracker**: Import tracked threads from the bot and create scene files
@@ -78,11 +78,13 @@ You can run **Initialize MultiMuse workspace** again only after removing or rena
 
 ### Sending Messages as Muse
 
-1. Open a scene file in Obsidian
+1. Open a scene file in **Editing** view (not Reading)
 2. Select the text you want to send
-3. Right-click → **"Send as Muse"**
+3. Run **Send as Muse** from the Command Palette, the editor selection menu, or the mobile toolbar
 4. If multiple characters are in the frontmatter, select which muse to post as
-5. The message will be automatically posted to the Discord thread
+5. The message will be posted to the Discord thread
+
+On **mobile**, add **Send as Muse** and **Insert @ mention** to the toolbar: open a note in Editing view, then Settings → Toolbar (or Mobile → Configure toolbar) and add those commands. They only appear in that list because they are editor commands.
 
 ### Scene File Format
 
@@ -121,6 +123,8 @@ Created: 2024-01-15
 - **Check Discord Threads Now**: Manually trigger a check for all scenes
 - **Toggle Discord Polling**: Enable/disable automatic polling
 - **Create New Scene**: Create a new scene file with muse selection
+- **Send as Muse**: Post the selected text to the Discord thread as a muse
+- **Insert @ mention**: Insert a Discord `<@userId>` mention at the cursor
 - **Sync from Tracker**: Sync scenes from bot tracker to Obsidian
 
 ## Settings
@@ -191,7 +195,9 @@ Created: 2024-01-15
 - Check the console (Ctrl+Shift+I) for errors
 
 ### "Send as Muse" not working
-- Ensure text is selected before right-clicking
+- Use **Editing** view (pencil), not Reading view
+- Select the text first, then run the command (Command Palette, toolbar, or selection menu)
+- On mobile, add **Send as Muse** to the editor toolbar — it will not appear in that list until this plugin version (1.12.5+)
 - Verify the file has `Link` and `Characters` in frontmatter
 - Check that the selected muse exists and is accessible
 - Verify your API key is configured correctly
