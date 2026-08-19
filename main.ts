@@ -494,9 +494,11 @@ export default class MultimuseObsidian extends Plugin {
 		if (typeof this.settings.autoCreateFromTracker !== 'boolean') {
 			this.settings.autoCreateFromTracker = false;
 		}
-		for (const [guildId, folder] of Object.entries(this.settings.guildFolderMap)) {
-			if (guildId === '0' || /^Server \d+$/i.test(folder)) {
-				delete this.settings.guildFolderMap[guildId];
+		const folderMap: Record<string, string> = this.settings.guildFolderMap;
+		for (const guildId of Object.keys(folderMap)) {
+			const folder = folderMap[guildId];
+			if (typeof folder !== 'string' || guildId === '0' || /^Server \d+$/i.test(folder)) {
+				delete folderMap[guildId];
 			}
 		}
 		// Ensure botApiUrl always uses default if empty or not set
@@ -2285,8 +2287,11 @@ export default class MultimuseObsidian extends Plugin {
 
 	async updateFrontmatter(file: TFile, key: string, value: FrontmatterValue): Promise<void> {
 		try {
-			await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-				frontmatter[key] = value;
+			await this.app.fileManager.processFrontMatter(file, (rawFrontmatter: unknown) => {
+				if (typeof rawFrontmatter !== 'object' || rawFrontmatter === null) {
+					return;
+				}
+				Reflect.set(rawFrontmatter, key, value);
 			});
 		} catch {
 			/* YAML parse errors leave the note unchanged; next poll retries */
