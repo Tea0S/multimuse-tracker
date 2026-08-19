@@ -14,6 +14,16 @@ interface MultimuseObsidianSettings {
 	trackIsActive: boolean; // Whether to add Is Active? property (defaulting to true)
 	/** When enabled, Characters + Participants frontmatter push to the API (keyed by Link thread id). */
 	obsidianSourceOfTruth: boolean;
+	/** Create vault notes for *new* tracked threads after this is turned on (not existing history). */
+	autoCreateFromTracker: boolean;
+	/** True after the current tracker list has been snapshotted so auto-create will not backfill. */
+	trackerImportSeeded: boolean;
+	/** Thread ids already seen; auto-create only files ids that appear after the snapshot. */
+	trackerSeenThreadIds: string[];
+	/** Discord guild id -> folder under scenesFolder (e.g. "The Scarlet Compact"). */
+	guildFolderMap: Record<string, string>;
+	/** Discord guild id -> last known server name (settings UI). */
+	guildNameCache: Record<string, string>;
 }
 
 /** Canonical API base URL (no trailing slash). Old IP:port configs are migrated to this on load. */
@@ -32,6 +42,11 @@ const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
 	trackRoleplay: true, // Default: extract Roleplay from folder path
 	trackIsActive: true, // Default: add Is Active? property
 	obsidianSourceOfTruth: false,
+	autoCreateFromTracker: false,
+	trackerImportSeeded: false,
+	trackerSeenThreadIds: [],
+	guildFolderMap: {},
+	guildNameCache: {},
 };
 
 interface MuseInfo {
@@ -77,7 +92,10 @@ interface TrackedThread {
 	scene_path?: string;
 	scene_paths?: string[];
 	guild_id?: string | number | null;
+	guild_name?: string | null;
 	thread_name?: string;
+	scene_name?: string;
+	archived?: boolean | null;
 }
 
 interface TrackedThreadsResponse {
@@ -160,6 +178,26 @@ function parseJson<T>(text: string): T {
 	return JSON.parse(text) as T;
 }
 
+function readApiErrorMessage(response: RequestUrlResponse): string {
+	const text = (response.text || '').trim();
+	if (!text) {
+		return `HTTP ${response.status}`;
+	}
+	const looksHtml = text.startsWith('<') || /^<!doctype html/i.test(text);
+	if (looksHtml) {
+		return `MultiMuse API returned a web page instead of JSON (HTTP ${response.status}). The API may be down, or a live tracker connection failed in front of it.`;
+	}
+	try {
+		const data = JSON.parse(text) as ApiErrorBody;
+		if (typeof data.message === 'string' && data.message.trim()) {
+			return data.message;
+		}
+	} catch {
+		/* use a short raw snippet */
+	}
+	return text.replace(/\s+/g, ' ').slice(0, 180) || `HTTP ${response.status}`;
+}
+
 function getErrorMessage(error: unknown): string {
 	if (error && typeof error === 'object') {
 		const details = error as { message?: unknown; text?: unknown };
@@ -188,9 +226,47 @@ function metadataFingerprint(characters: string[], participants: number): string
 	return `${sortNamesAlphabetically(characters).join('\x1f')}|${participants}`;
 }
 
+function isVaultScenePath(path: unknown): path is string {
+	if (typeof path !== 'string') {
+		return false;
+	}
+	const trimmed = path.trim();
+	if (!trimmed) {
+		return false;
+	}
+	return !/^(https?:\/\/|discord:\/\/)/i.test(trimmed);
+}
+
+function sanitizeNoteTitle(name: string): string {
+	const cleaned = name
+		.replace(/[\\/:*?"<>|#[\]]/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.slice(0, 120);
+	return cleaned || 'Untitled scene';
+}
+
+function discordThreadUrl(guildId: string, threadId: string): string {
+	return `https://discord.com/channels/${guildId}/${threadId}`;
+}
+
+function isUsableGuildId(guildId: string): boolean {
+	return /^\d+$/.test(guildId) && guildId !== '0';
+}
+
+function yamlNeedsQuotes(value: string): boolean {
+	return /[:#]|^\s|\s$/.test(value)
+		|| value === ''
+		|| value === 'true'
+		|| value === 'false'
+		|| value === 'null';
+}
+
 export default class MultimuseObsidian extends Plugin {
 	settings: MultimuseObsidianSettings;
 	pollIntervalId: number | null = null;
+	/** Faster import tick while auto-create is on (separate from Replied? poll). */
+	trackerImportIntervalId: number | null = null;
 	/** Bumped to cancel an in-flight poll when the user posts as muse (frees API for POST). */
 	pollGeneration = 0;
 	isPollRunning = false;
@@ -215,6 +291,14 @@ export default class MultimuseObsidian extends Plugin {
 	sceneCreationKeymapScope: Scope | null = null;
 	/** Last non-empty editor selection — mobile toolbar taps often clear the live selection. */
 	private lastEditorSelection = '';
+	/** Live tracker socket so auto-create does not wait for poll. */
+	private trackerEventsSocket: WebSocket | null = null;
+	private trackerEventsReconnectTimer: number | null = null;
+	private trackerEventsBackoffMs = 15000;
+	private trackerEventsShouldRun = false;
+	private trackerEventsEverReady = false;
+	private trackerEventsFailCount = 0;
+	private pendingLiveCreates = new Map<string, { thread: TrackedThread; timer: number }>();
 
 	async onload() {
 		await this.loadSettings();
@@ -224,11 +308,14 @@ export default class MultimuseObsidian extends Plugin {
 
 		// Warm auth + muse cache in background so onload does not block the editor
 		if (this.settings.apiKey) {
-			void this.getUserIdFromApiKey().then(() => void this.syncMuses());
+			void this.getUserIdFromApiKey().then(() => {
+				void this.syncMuses();
+				this.syncTrackerLiveConnection();
+			});
 		}
 
 		// Start polling if enabled (first poll deferred so startup stays responsive)
-		if (this.settings.enabled && this.settings.apiKey) {
+		if (this.settings.apiKey && (this.settings.enabled || this.settings.autoCreateFromTracker)) {
 			this.startPolling({ deferInitialCheck: true });
 		}
 
@@ -248,13 +335,12 @@ export default class MultimuseObsidian extends Plugin {
 			callback: () => {
 				this.settings.enabled = !this.settings.enabled;
 				void this.saveSettings();
-				if (this.settings.enabled) {
+				if (this.settings.enabled || this.settings.autoCreateFromTracker) {
 					this.startPolling();
-					new Notice('Discord polling enabled');
 				} else {
 					this.stopPolling();
-					new Notice('Discord polling disabled');
 				}
+				new Notice(this.settings.enabled ? 'Discord polling enabled' : 'Discord polling disabled');
 			}
 		});
 
@@ -265,6 +351,15 @@ export default class MultimuseObsidian extends Plugin {
 			icon: 'file-plus',
 			callback: () => {
 				void this.createNewScene();
+			}
+		});
+
+		this.addCommand({
+			id: 'import-unfiled-tracked-scenes',
+			name: 'Import unfiled tracked scenes',
+			icon: 'download',
+			callback: () => {
+				void this.importUnfiledTrackedScenesNow();
 			}
 		});
 
@@ -369,6 +464,8 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	onunload() {
+		this.trackerEventsShouldRun = false;
+		this.disconnectTrackerLiveConnection();
 		this.stopPolling();
 		for (const timerId of this.sceneChangeDebounceTimers.values()) {
 			window.clearTimeout(timerId);
@@ -382,6 +479,26 @@ export default class MultimuseObsidian extends Plugin {
 			? loaded as Partial<MultimuseObsidianSettings>
 			: {};
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+		if (!this.settings.guildFolderMap || typeof this.settings.guildFolderMap !== 'object') {
+			this.settings.guildFolderMap = {};
+		}
+		if (!this.settings.guildNameCache || typeof this.settings.guildNameCache !== 'object') {
+			this.settings.guildNameCache = {};
+		}
+		if (!Array.isArray(this.settings.trackerSeenThreadIds)) {
+			this.settings.trackerSeenThreadIds = [];
+		}
+		if (typeof this.settings.trackerImportSeeded !== 'boolean') {
+			this.settings.trackerImportSeeded = false;
+		}
+		if (typeof this.settings.autoCreateFromTracker !== 'boolean') {
+			this.settings.autoCreateFromTracker = false;
+		}
+		for (const [guildId, folder] of Object.entries(this.settings.guildFolderMap)) {
+			if (guildId === '0' || /^Server \d+$/i.test(folder)) {
+				delete this.settings.guildFolderMap[guildId];
+			}
+		}
 		// Ensure botApiUrl always uses default if empty or not set
 		if (!this.settings.botApiUrl || this.settings.botApiUrl.trim() === '') {
 			this.settings.botApiUrl = DEFAULT_SETTINGS.botApiUrl;
@@ -410,6 +527,12 @@ export default class MultimuseObsidian extends Plugin {
 		this.pollIntervalId = window.setInterval(() => {
 			void this.checkAllThreads();
 		}, intervalMs);
+
+		if (this.settings.autoCreateFromTracker) {
+			this.trackerImportIntervalId = window.setInterval(() => {
+				void this.pollNewTrackedThreads();
+			}, 60_000);
+		}
 
 		if (!opts?.deferInitialCheck) {
 			void this.checkAllThreads();
@@ -463,6 +586,10 @@ export default class MultimuseObsidian extends Plugin {
 			window.clearInterval(this.pollIntervalId);
 			this.pollIntervalId = null;
 		}
+		if (this.trackerImportIntervalId !== null) {
+			window.clearInterval(this.trackerImportIntervalId);
+			this.trackerImportIntervalId = null;
+		}
 	}
 
 	/**
@@ -474,6 +601,208 @@ export default class MultimuseObsidian extends Plugin {
 			? DEFAULT_SETTINGS.botApiUrl
 			: this.settings.botApiUrl.trim();
 		return base.replace(/\/+$/, ''); // no trailing slash
+	}
+
+	getEventsWsUrl(): string {
+		return `${this.getBotApiUrl().replace(/^http/i, 'ws')}/api/v1/events`;
+	}
+
+	resetTrackerLiveConnection(): void {
+		this.trackerEventsFailCount = 0;
+		this.trackerEventsEverReady = false;
+		this.trackerEventsBackoffMs = 15000;
+		this.syncTrackerLiveConnection();
+	}
+
+	syncTrackerLiveConnection(): void {
+		const shouldRun = !!(
+			this.settings.autoCreateFromTracker
+			&& this.settings.apiKey
+			&& this.settings.apiKey.trim()
+			&& this.settings.cachedUserId
+		);
+		this.trackerEventsShouldRun = shouldRun;
+		if (!shouldRun) {
+			this.disconnectTrackerLiveConnection();
+			return;
+		}
+		if (this.trackerEventsFailCount >= 2 && !this.trackerEventsEverReady) {
+			return;
+		}
+		if (this.trackerEventsSocket && (this.trackerEventsSocket.readyState === WebSocket.OPEN || this.trackerEventsSocket.readyState === WebSocket.CONNECTING)) {
+			return;
+		}
+		this.connectTrackerLiveConnection();
+	}
+
+	private disconnectTrackerLiveConnection(): void {
+		if (this.trackerEventsReconnectTimer != null) {
+			window.clearTimeout(this.trackerEventsReconnectTimer);
+			this.trackerEventsReconnectTimer = null;
+		}
+		for (const pending of this.pendingLiveCreates.values()) {
+			window.clearTimeout(pending.timer);
+		}
+		this.pendingLiveCreates.clear();
+		const socket = this.trackerEventsSocket;
+		this.trackerEventsSocket = null;
+		if (socket) {
+			try {
+				socket.close();
+			} catch {
+				/* already closed */
+			}
+		}
+	}
+
+	private scheduleTrackerLiveReconnect(): void {
+		if (!this.trackerEventsShouldRun || !this.trackerEventsEverReady) {
+			return;
+		}
+		if (this.trackerEventsReconnectTimer != null) {
+			return;
+		}
+		const delay = this.trackerEventsBackoffMs;
+		this.trackerEventsBackoffMs = Math.min(this.trackerEventsBackoffMs * 2, 5 * 60_000);
+		this.trackerEventsReconnectTimer = window.setTimeout(() => {
+			this.trackerEventsReconnectTimer = null;
+			if (this.trackerEventsShouldRun) {
+				this.connectTrackerLiveConnection();
+			}
+		}, delay);
+	}
+
+	private connectTrackerLiveConnection(): void {
+		if (!this.trackerEventsShouldRun || !this.settings.apiKey) {
+			return;
+		}
+		if (this.trackerEventsFailCount >= 2 && !this.trackerEventsEverReady) {
+			return;
+		}
+		if (this.trackerEventsSocket && (this.trackerEventsSocket.readyState === WebSocket.OPEN || this.trackerEventsSocket.readyState === WebSocket.CONNECTING)) {
+			return;
+		}
+		let socket: WebSocket;
+		try {
+			socket = new WebSocket(this.getEventsWsUrl());
+		} catch {
+			this.trackerEventsFailCount += 1;
+			this.scheduleTrackerLiveReconnect();
+			return;
+		}
+		this.trackerEventsSocket = socket;
+		socket.addEventListener('open', () => {
+			if (this.trackerEventsSocket !== socket) {
+				return;
+			}
+			try {
+				socket.send(JSON.stringify({ type: 'auth', token: this.settings.apiKey.trim() }));
+			} catch {
+				socket.close();
+			}
+		});
+		socket.addEventListener('message', (event) => {
+			if (this.trackerEventsSocket !== socket) {
+				return;
+			}
+			this.handleTrackerLiveMessage(event.data);
+		});
+		socket.addEventListener('close', () => {
+			if (this.trackerEventsSocket !== socket) {
+				return;
+			}
+			this.trackerEventsSocket = null;
+			if (!this.trackerEventsEverReady) {
+				this.trackerEventsFailCount += 1;
+				if (this.trackerEventsFailCount >= 2) {
+					this.trackerEventsShouldRun = false;
+					return;
+				}
+			}
+			this.scheduleTrackerLiveReconnect();
+		});
+		socket.addEventListener('error', () => {
+			try {
+				socket.close();
+			} catch {
+				/* ignore */
+			}
+		});
+	}
+
+	private handleTrackerLiveMessage(raw: unknown): void {
+		if (typeof raw !== 'string' || !raw) {
+			return;
+		}
+		let data: { type?: string } & TrackedThread;
+		try {
+			data = JSON.parse(raw) as { type?: string } & TrackedThread;
+		} catch {
+			return;
+		}
+		if (data.type === 'ready' || data.type === 'pong') {
+			if (data.type === 'ready') {
+				this.trackerEventsEverReady = true;
+				this.trackerEventsFailCount = 0;
+				this.trackerEventsBackoffMs = 15000;
+			}
+			return;
+		}
+		if (data.type !== 'thread_tracked') {
+			return;
+		}
+		const threadId = String(data.thread_id || '').trim();
+		if (!threadId) {
+			return;
+		}
+		const existing = this.pendingLiveCreates.get(threadId);
+		const merged = existing ? this.mergeTrackedThreads(existing.thread, data) : data;
+		if (existing) {
+			window.clearTimeout(existing.timer);
+		}
+		const timer = window.setTimeout(() => {
+			this.pendingLiveCreates.delete(threadId);
+			void this.createNoteFromLiveTrackerEvent(merged);
+		}, 1500);
+		this.pendingLiveCreates.set(threadId, { thread: merged, timer });
+	}
+
+	private mergeTrackedThreads(a: TrackedThread, b: TrackedThread): TrackedThread {
+		const names = [...new Set([
+			...this.trackedThreadCharacters(a),
+			...this.trackedThreadCharacters(b),
+		])];
+		const participantsA = typeof a.participants === 'number' ? a.participants : parseInt(String(a.participants || '0'), 10);
+		const participantsB = typeof b.participants === 'number' ? b.participants : parseInt(String(b.participants || '0'), 10);
+		return {
+			...a,
+			...b,
+			muse_name: names[0] || b.muse_name || a.muse_name,
+			muse_names: names,
+			guild_name: b.guild_name || a.guild_name,
+			thread_name: b.thread_name || a.thread_name,
+			scene_name: b.scene_name || a.scene_name,
+			participants: Math.max(
+				!isNaN(participantsA) ? participantsA : 0,
+				!isNaN(participantsB) ? participantsB : 0,
+				names.length,
+				2
+			),
+		};
+	}
+
+	private async createNoteFromLiveTrackerEvent(thread: TrackedThread): Promise<void> {
+		if (!this.settings.autoCreateFromTracker) {
+			return;
+		}
+		const userId = await this.getPrimaryUserId();
+		if (!userId) {
+			return;
+		}
+		const created = await this.importUnfiledTrackedThreads([thread], userId, { mode: 'live' });
+		if (created > 0) {
+			new Notice(`Created ${created} scene note(s) from tracker`);
+		}
 	}
 
 	private sleep(ms: number): Promise<void> {
@@ -579,8 +908,11 @@ export default class MultimuseObsidian extends Plugin {
 			if (Array.isArray(value)) {
 				lines.push(`${String(key)}:`);
 				for (const item of value) {
-					lines.push(`  - ${item}`);
+					const itemText = String(item);
+					lines.push(`  - ${yamlNeedsQuotes(itemText) ? JSON.stringify(itemText) : itemText}`);
 				}
+			} else if (typeof value === 'string') {
+				lines.push(`${String(key)}: ${yamlNeedsQuotes(value) ? JSON.stringify(value) : value}`);
 			} else {
 				lines.push(`${String(key)}: ${value}`);
 			}
@@ -784,8 +1116,41 @@ export default class MultimuseObsidian extends Plugin {
 		}
 	}
 
+	async pollNewTrackedThreads(): Promise<void> {
+		if (!this.settings.autoCreateFromTracker || !this.settings.apiKey) {
+			return;
+		}
+		const userId = await this.getPrimaryUserId();
+		if (!userId) {
+			return;
+		}
+		try {
+			const trackedUrl = `${this.getBotApiUrl()}/api/v1/threads/tracked?user_id=${userId}`;
+			const trackedResponse = await this.enqueuePollGet(() => requestUrl({
+				url: trackedUrl,
+				method: 'GET',
+				headers: this.getApiHeaders(),
+				throw: false,
+			}));
+			if (trackedResponse.status !== 200) {
+				return;
+			}
+			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
+			const threads = Array.isArray(trackedData.threads) ? trackedData.threads : [];
+			const createdCount = await this.importUnfiledTrackedThreads(threads, userId, { mode: 'new' });
+			if (createdCount > 0) {
+				new Notice(`Created ${createdCount} scene note(s) from tracker`);
+			}
+		} catch {
+			/* next import tick retries */
+		}
+	}
+
 	async checkAllThreads(opts?: { force?: boolean }) {
-		if (!this.settings.enabled || !this.settings.apiKey) {
+		if (!this.settings.apiKey) {
+			return;
+		}
+		if (!this.settings.enabled && !this.settings.autoCreateFromTracker) {
 			return;
 		}
 
@@ -834,9 +1199,25 @@ export default class MultimuseObsidian extends Plugin {
 				return;
 			}
 
-			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
-			const trackedThreads = trackedData.threads || [];
+			let trackedThreads: TrackedThread[] = [];
+			try {
+				const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
+				trackedThreads = Array.isArray(trackedData.threads) ? trackedData.threads : [];
+			} catch {
+				return;
+			}
+			if (this.settings.autoCreateFromTracker) {
+				const createdCount = await this.importUnfiledTrackedThreads(
+					trackedThreads,
+					primaryUserIdStr,
+					{ mode: 'new' }
+				);
+				if (createdCount > 0) {
+					new Notice(`Created ${createdCount} scene note(s) from tracker`);
+				}
+			}
 			const scenePathMap = this.buildScenePathMap(trackedThreads);
+			const queriedPaths = new Set<string>();
 			let updatedCount = 0;
 
 			// Phase 1 (API-first): one scene at a time so Send as Muse can jump the queue sooner.
@@ -865,6 +1246,7 @@ export default class MultimuseObsidian extends Plugin {
 						continue;
 					}
 
+					queriedPaths.add(file.path);
 					const updated = await this.queryTrackedSceneByThreadId(
 						file,
 						threadInfo.thread_id,
@@ -884,14 +1266,56 @@ export default class MultimuseObsidian extends Plugin {
 				}
 			}
 
-			// Phase 2 (orphan fallback): active vault scenes with Link not in tracker path map.
+			// Phase 1b: vault notes linked by Discord URL even when the API has no vault path.
+			if (generation === this.pollGeneration) {
+				const existingByThread = this.getExistingSceneLinksByThreadId();
+				for (const thread of trackedThreads) {
+					if (generation !== this.pollGeneration) {
+						break;
+					}
+					const threadId = String(thread.thread_id || '').trim();
+					const file = existingByThread.get(threadId);
+					if (!file || queriedPaths.has(file.path) || this.recentlyCreatedFiles.has(file.path)) {
+						continue;
+					}
+					try {
+						const cache = this.app.metadataCache.getFileCache(file);
+						const frontmatter = this.getFrontmatter(cache);
+						if (!frontmatter || !this.isSceneMarkedActive(frontmatter)) {
+							continue;
+						}
+						if (this.getCharacterNames(frontmatter).length === 0) {
+							continue;
+						}
+						queriedPaths.add(file.path);
+						const updated = await this.queryTrackedSceneByThreadId(
+							file,
+							threadId,
+							primaryUserIdStr,
+							'checkAllThreadsViaBotApi',
+							opts
+						);
+						if (updated) {
+							updatedCount++;
+						}
+						if (generation !== this.pollGeneration) {
+							break;
+						}
+						await this.sleep(POLL_SCENE_DELAY_MS);
+					} catch {
+						/* continue remaining linked scenes */
+					}
+				}
+			}
+
+			// Phase 2 (orphan fallback): active vault scenes with Link not already queried.
 			if (generation === this.pollGeneration) {
 				for (const file of this.getActiveSceneFiles()) {
 					if (generation !== this.pollGeneration) {
 						break;
 					}
 					try {
-						if (scenePathMap.has(file.path)) {
+						if (queriedPaths.has(file.path) || scenePathMap.has(file.path)) {
 							continue;
 						}
 
@@ -947,11 +1371,13 @@ export default class MultimuseObsidian extends Plugin {
 	buildScenePathMap(trackedThreads: TrackedThread[]): Map<string, TrackedThread> {
 		const scenePathMap = new Map<string, TrackedThread>();
 		for (const thread of trackedThreads) {
-			if (thread.scene_path) {
-				scenePathMap.set(thread.scene_path, thread);
+			if (isVaultScenePath(thread.scene_path)) {
+				scenePathMap.set(thread.scene_path.trim(), thread);
 			}
 			for (const scenePath of thread.scene_paths || []) {
-				scenePathMap.set(scenePath, thread);
+				if (isVaultScenePath(scenePath)) {
+					scenePathMap.set(scenePath.trim(), thread);
+				}
 			}
 		}
 		return scenePathMap;
@@ -1435,6 +1861,355 @@ export default class MultimuseObsidian extends Plugin {
 		return map;
 	}
 
+	markFileRecentlyCreated(filePath: string): void {
+		this.recentlyCreatedFiles.add(filePath);
+		window.setTimeout(() => {
+			this.recentlyCreatedFiles.delete(filePath);
+		}, 60000);
+	}
+
+	getTopLevelSceneFolderNames(): string[] {
+		const root = this.app.vault.getAbstractFileByPath(this.settings.scenesFolder);
+		if (!(root instanceof TFolder)) {
+			return [];
+		}
+		return root.children
+			.filter((child): child is TFolder => child instanceof TFolder)
+			.map((folder) => folder.name);
+	}
+
+	rememberGuildName(guildId: string, guildName?: string | null): boolean {
+		const name = (guildName || '').trim();
+		if (!guildId || !name) {
+			return false;
+		}
+		if (this.settings.guildNameCache[guildId] !== name) {
+			this.settings.guildNameCache[guildId] = name;
+			return true;
+		}
+		return false;
+	}
+
+	matchExistingServerFolder(guildName: string): string | null {
+		const folders = this.getTopLevelSceneFolderNames();
+		const candidates = [guildName.trim(), guildName.split('|')[0].trim()].filter(Boolean);
+		for (const candidate of candidates) {
+			const hit = folders.find(
+				(folder) => folder.localeCompare(candidate, undefined, { sensitivity: 'base' }) === 0
+			);
+			if (hit) {
+				return hit;
+			}
+		}
+		return null;
+	}
+
+	resolveServerFolder(guildId: string, guildName?: string | null): string {
+		const mapped = (this.settings.guildFolderMap[guildId] || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+		if (mapped) {
+			return `${this.settings.scenesFolder}/${mapped}`;
+		}
+
+		const name = (guildName || this.settings.guildNameCache[guildId] || '').trim();
+		const matched = name ? this.matchExistingServerFolder(name) : null;
+		const folderName = matched
+			|| sanitizeNoteTitle(name.split('|')[0] || name || `Server ${guildId.slice(-4)}`);
+		this.settings.guildFolderMap[guildId] = folderName;
+		return `${this.settings.scenesFolder}/${folderName}`;
+	}
+
+	async uniqueSceneFilePath(folderPath: string, title: string): Promise<string> {
+		let candidate = `${folderPath}/${title}.md`;
+		if (!this.app.vault.getAbstractFileByPath(candidate)) {
+			return candidate;
+		}
+		let n = 2;
+		while (this.app.vault.getAbstractFileByPath(`${folderPath}/${title} ${n}.md`)) {
+			n += 1;
+		}
+		return `${folderPath}/${title} ${n}.md`;
+	}
+
+	trackedThreadCharacters(thread: TrackedThread): string[] {
+		const fromList = (thread.muse_names || [])
+			.map((name) => name.trim())
+			.filter((name) => name.length > 0 && name.toLowerCase() !== 'unknown');
+		if (fromList.length > 0) {
+			return sortNamesAlphabetically([...new Set(fromList)]);
+		}
+		const single = (thread.muse_name || '').trim();
+		if (single && single.toLowerCase() !== 'unknown') {
+			return [single];
+		}
+		return [];
+	}
+
+	trackedThreadTitle(thread: TrackedThread): string {
+		const fromScene = (thread.scene_name || '').trim();
+		if (fromScene && !/^Thread \d+$/i.test(fromScene)) {
+			return sanitizeNoteTitle(fromScene);
+		}
+		const fromThread = (thread.thread_name || '').trim();
+		if (fromThread && !/^Thread \d+$/i.test(fromThread)) {
+			return sanitizeNoteTitle(fromThread);
+		}
+		return 'Untitled scene';
+	}
+
+	isLiveActiveScene(thread: TrackedThread): boolean {
+		if (thread.archived === true) {
+			return false;
+		}
+		if (thread.archived === false) {
+			return true;
+		}
+		const name = (thread.thread_name || '').trim();
+		return !!name && !/^Thread \d+$/i.test(name);
+	}
+
+	async seedTrackerSeenSnapshot(): Promise<void> {
+		if (this.settings.trackerImportSeeded) {
+			return;
+		}
+		const userId = await this.getPrimaryUserId();
+		if (!userId) {
+			return;
+		}
+		try {
+			const trackedUrl = `${this.getBotApiUrl()}/api/v1/threads/tracked?user_id=${userId}`;
+			const trackedResponse = await requestUrl({
+				url: trackedUrl,
+				method: 'GET',
+				headers: this.getApiHeaders(),
+				throw: false,
+			});
+			if (trackedResponse.status !== 200) {
+				return;
+			}
+			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
+			const threads = Array.isArray(trackedData.threads) ? trackedData.threads : [];
+			this.settings.trackerSeenThreadIds = [...new Set(
+				threads
+					.map((thread) => String(thread.thread_id || '').trim())
+					.filter(Boolean)
+			)];
+			this.settings.trackerImportSeeded = true;
+			for (const thread of threads) {
+				const guildId = thread.guild_id != null ? String(thread.guild_id).trim() : '';
+				if (isUsableGuildId(guildId)) {
+					this.rememberGuildName(guildId, thread.guild_name);
+				}
+			}
+			await this.saveSettings();
+		} catch {
+			/* first successful poll will snapshot instead */
+		}
+	}
+
+	async onAutoCreateFromTrackerChanged(enabled: boolean): Promise<void> {
+		this.settings.autoCreateFromTracker = enabled;
+		await this.saveSettings();
+		if (enabled) {
+			await this.seedTrackerSeenSnapshot();
+			this.resetTrackerLiveConnection();
+			this.startPolling();
+		} else {
+			this.syncTrackerLiveConnection();
+			if (!this.settings.enabled) {
+				this.stopPolling();
+			}
+		}
+	}
+
+	async importUnfiledTrackedScenesNow(): Promise<void> {
+		if (!this.settings.apiKey) {
+			new Notice('API key must be configured in settings.');
+			return;
+		}
+		const primaryUserIdStr = await this.getPrimaryUserId();
+		if (!primaryUserIdStr) {
+			new Notice('Failed to get user ID from API key. Please check your API key in settings.');
+			return;
+		}
+			new Notice('Importing unfiled active scenes…');
+		try {
+			const trackedUrl = `${this.getBotApiUrl()}/api/v1/threads/tracked?user_id=${primaryUserIdStr}&active_only=1`;
+			const trackedResponse = await requestUrl({
+				url: trackedUrl,
+				method: 'GET',
+				headers: this.getApiHeaders(),
+				throw: false,
+			});
+			if (trackedResponse.status !== 200) {
+				this.handleApiError(trackedResponse, 'importUnfiledTrackedScenesNow');
+				new Notice('Failed to fetch tracked threads.');
+				return;
+			}
+			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
+			const createdCount = await this.importUnfiledTrackedThreads(
+				trackedData.threads || [],
+				primaryUserIdStr,
+				{ mode: 'backfill' }
+			);
+			if (createdCount > 0) {
+				new Notice(`Created ${createdCount} scene note(s) from tracker`);
+			} else {
+				new Notice('No unfiled active scenes to import.');
+			}
+		} catch (error) {
+			new Notice(`Failed to import tracked scenes: ${getErrorMessage(error)}`);
+		}
+	}
+
+	async importUnfiledTrackedThreads(
+		trackedThreads: TrackedThread[],
+		userId: string,
+		opts: { mode: 'new' | 'backfill' | 'live' }
+	): Promise<number> {
+		const currentIds = [...new Set(
+			trackedThreads
+				.map((thread) => String(thread.thread_id || '').trim())
+				.filter(Boolean)
+		)];
+
+		if (opts.mode === 'new') {
+			if (!this.settings.trackerImportSeeded) {
+				this.settings.trackerSeenThreadIds = currentIds;
+				this.settings.trackerImportSeeded = true;
+				await this.saveSettings();
+				return 0;
+			}
+		}
+
+		const seen = new Set(this.settings.trackerSeenThreadIds || []);
+		const existing = this.getExistingSceneLinksByThreadId();
+		let createdCount = 0;
+		let settingsDirty = false;
+		const previousCreationLock = this.sceneCreationInProgress;
+		this.sceneCreationInProgress = true;
+		try {
+			for (const thread of trackedThreads) {
+				const threadId = String(thread.thread_id || '').trim();
+				const guildId = thread.guild_id != null && String(thread.guild_id).trim() !== ''
+					? String(thread.guild_id)
+					: '';
+				if (!threadId || !isUsableGuildId(guildId)) {
+					continue;
+				}
+				if (this.rememberGuildName(guildId, thread.guild_name)) {
+					settingsDirty = true;
+				}
+				if (opts.mode === 'new' && seen.has(threadId)) {
+					continue;
+				}
+				if (thread.archived === true) {
+					seen.add(threadId);
+					settingsDirty = true;
+					continue;
+				}
+				if (opts.mode === 'backfill' && !this.isLiveActiveScene(thread)) {
+					continue;
+				}
+				if (existing.has(threadId)) {
+					seen.add(threadId);
+					continue;
+				}
+
+				const characters = this.trackedThreadCharacters(thread);
+				if (characters.length === 0) {
+					continue;
+				}
+
+				const title = this.trackedThreadTitle(thread);
+				if (title === 'Untitled scene') {
+					continue;
+				}
+
+				const folderPath = this.resolveServerFolder(guildId, thread.guild_name);
+				settingsDirty = true;
+				await this.ensureFolderPathExists(folderPath);
+
+				const filePath = await this.uniqueSceneFilePath(folderPath, title);
+				const participantsRaw = typeof thread.participants === 'number'
+					? thread.participants
+					: parseInt(String(thread.participants || '2'), 10);
+				const participants = !isNaN(participantsRaw) && participantsRaw >= 1
+					? Math.min(participantsRaw, 99)
+					: 2;
+
+				const frontmatter: Record<string, FrontmatterValue> = {
+					'Link': discordThreadUrl(guildId, threadId),
+					'Characters': characters,
+					'Participants': participants,
+					'Replied?': false,
+					'Created': new Date().toISOString().split('T')[0],
+				};
+				if (this.settings.trackRoleplay) {
+					const roleplay = this.extractRoleplayFromPath(folderPath);
+					if (roleplay) {
+						frontmatter['Roleplay'] = roleplay;
+					}
+				}
+				if (this.settings.trackIsActive) {
+					frontmatter['Is Active?'] = true;
+				}
+
+				this.markFileRecentlyCreated(filePath);
+				const createdFile = await this.app.vault.create(filePath, this.formatFrontmatterYaml(frontmatter));
+				existing.set(threadId, createdFile);
+				seen.add(threadId);
+
+				try {
+					const registerResponse = await this.registerScene({
+						threadId,
+						userId,
+						scenePath: createdFile.path,
+						characters,
+						participants,
+						guildId,
+						isActive: true,
+					});
+					if (registerResponse.status === 200) {
+						this.sceneMetadataSyncCache.set(
+							createdFile.path,
+							metadataFingerprint(characters, participants)
+						);
+						if (this.settings.basePath) {
+							try {
+								await this.addSceneToBase(createdFile, frontmatter);
+							} catch {
+								/* markdown tracker table update is optional */
+							}
+						}
+					} else {
+						this.handleApiError(registerResponse, 'importUnfiledTrackedThreads - register');
+					}
+				} catch {
+					/* register is best-effort after the note exists */
+				}
+
+				createdCount += 1;
+			}
+		} finally {
+			this.sceneCreationInProgress = previousCreationLock;
+		}
+
+		const nextSeen = Array.from(seen);
+		if (
+			nextSeen.length !== this.settings.trackerSeenThreadIds.length
+			|| nextSeen.some((id, index) => id !== this.settings.trackerSeenThreadIds[index])
+		) {
+			this.settings.trackerSeenThreadIds = nextSeen;
+			this.settings.trackerImportSeeded = true;
+			settingsDirty = true;
+		}
+
+		if (settingsDirty) {
+			await this.saveSettings();
+		}
+		return createdCount;
+	}
+
 	collectMarkdownFiles(fileOrFolder: TAbstractFile, files: TFile[]): void {
 		if (fileOrFolder instanceof TFile && fileOrFolder.extension === 'md') {
 			files.push(fileOrFolder);
@@ -1509,51 +2284,13 @@ export default class MultimuseObsidian extends Plugin {
 
 
 	async updateFrontmatter(file: TFile, key: string, value: FrontmatterValue): Promise<void> {
-		const content = await this.app.vault.read(file);
-		
-		// Parse frontmatter
-		const frontmatterRegex = /^---\s*\n([\s\S]*?)\n---\s*\n/;
-		const match = content.match(frontmatterRegex);
-		
-		if (!match) {
-			return;
+		try {
+			await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+				frontmatter[key] = value;
+			});
+		} catch {
+			/* YAML parse errors leave the note unchanged; next poll retries */
 		}
-
-		let frontmatterText = match[1];
-		const body = content.slice(match[0].length);
-
-		// Escape special regex characters in the key
-		const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-		
-		// Format value for YAML (handle booleans, strings, etc.)
-		let formattedValue: string;
-		if (typeof value === 'boolean') {
-			formattedValue = value.toString(); // "true" or "false"
-		} else if (typeof value === 'string') {
-			formattedValue = value;
-		} else {
-			formattedValue = String(value);
-		}
-		
-		// Update the key-value pair - match the key at the start of a line
-		// Handle both single-line and multi-line values
-		// Match any value after the colon (including true/false, "true"/"false", etc.)
-		const keyRegex = new RegExp(`^${escapedKey}:\\s*(.+)$`, 'gm');
-		const keyMatch = frontmatterText.match(keyRegex);
-
-		if (keyMatch) {
-			// Replace ALL occurrences of the key (in case there are duplicates)
-			// Always update to the new value
-			frontmatterText = frontmatterText.replace(keyRegex, `${key}: ${formattedValue}`);
-		} else {
-			// Add new key-value pair at the end
-			frontmatterText += `\n${key}: ${formattedValue}`;
-		}
-
-		// Reconstruct file content
-		const newContent = `---\n${frontmatterText}\n---\n${body}`;
-		
-		await this.app.vault.modify(file, newContent);
 	}
 
 	// ========= NEW COMMAND METHODS =========
@@ -1707,15 +2444,10 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		}
 
+		this.markFileRecentlyCreated(filePath);
+
 		// Create file
 		const createdFile = await this.app.vault.create(filePath, content);
-		
-		// Mark this file as recently created to skip immediate checking
-		this.recentlyCreatedFiles.add(filePath);
-		// Remove from the set after 60 seconds (enough time for the scene to be registered and settled with the API)
-		window.setTimeout(() => {
-			this.recentlyCreatedFiles.delete(filePath);
-		}, 60000);
 
 		// 8) Link the vault scene to the current Discord-side thread tracker.
 		try {
@@ -2492,8 +3224,7 @@ export default class MultimuseObsidian extends Plugin {
 				}
 				void this.syncMuses();
 			} else if (!this.handleApiError(response, 'sendSelectionAsMuse - post message')) {
-				const errorData = parseJson<ApiErrorBody>(response.text);
-				new Notice(`Failed to send message: ${errorData.message || response.status}`);
+				new Notice(`Failed to send message: ${readApiErrorMessage(response)}`);
 			}
 		} catch (error) {
 			new Notice(`Failed to send message: ${getErrorMessage(error)}`);
@@ -2548,6 +3279,40 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				action: () => {
 					void this.plugin.initializeMultimuseWorkspace();
 				},
+			},
+			{
+				type: 'group',
+				heading: 'Import from tracker',
+				items: [
+					{
+						name: 'Auto-create notes from tracker',
+						desc: 'After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported.',
+						render: (setting: Setting) => {
+							setting.addToggle(toggle => toggle
+								.setValue(this.plugin.settings.autoCreateFromTracker)
+								.onChange(value => void this.plugin.onAutoCreateFromTrackerChanged(value)));
+						},
+					},
+					{
+						name: 'Import unfiled tracked scenes',
+						desc: 'Create notes for open (unarchived) tracked threads that are not already in the vault.',
+						action: () => {
+							void this.plugin.importUnfiledTrackedScenesNow();
+						},
+					},
+					{
+						name: 'Server folders',
+						desc: this.serverFolderSettingsDesc(),
+					},
+					{
+						name: 'Load servers from tracker',
+						desc: 'Fill the list below from Discord servers on your tracker. Matching existing folders is case-insensitive.',
+						action: () => {
+							void this.refreshServerFolderList();
+						},
+					},
+					...this.serverFolderSettingItems(),
+				],
 			},
 			{
 				type: 'group',
@@ -2618,11 +3383,11 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: 'Scene matching',
-						desc: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn.',
+						desc: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? Auto-create (off by default) only files new tracks after you turn it on.',
 					},
 					{
 						name: 'API key',
-						desc: 'Generate a key with /api generate in Discord DMs with the bot. Scenes are detected when queried; you do not register them by hand.',
+						desc: 'Generate a key with /api generate in Discord DMs with the bot. Auto-create can file new tracked threads into server folders.',
 					},
 				],
 			},
@@ -2681,6 +3446,37 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				.onClick(() => {
 					void this.plugin.initializeMultimuseWorkspace();
 				}));
+
+		new Setting(containerEl)
+			.setName('Import from tracker')
+			.setHeading();
+
+		new Setting(containerEl)
+			.setName('Auto-create notes from tracker')
+			.setDesc('After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.autoCreateFromTracker)
+				.onChange(value => void this.plugin.onAutoCreateFromTrackerChanged(value)));
+
+		new Setting(containerEl)
+			.setName('Import unfiled tracked scenes')
+			.setDesc('Create notes for open (unarchived) tracked threads that are not already in the vault.')
+			.addButton(button => button
+				.setButtonText('Import now')
+				.onClick(() => {
+					void this.plugin.importUnfiledTrackedScenesNow();
+				}));
+
+		new Setting(containerEl)
+			.setName('Load servers from tracker')
+			.setDesc('Fill the server list from Discord servers on your tracker.')
+			.addButton(button => button
+				.setButtonText('Load servers')
+				.onClick(() => {
+					void this.refreshServerFolderList();
+				}));
+
+		this.renderServerFolderSettings(containerEl);
 
 		new Setting(containerEl)
 			.setName('Scene properties')
@@ -2758,14 +3554,145 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('How it works')
 			.setHeading();
-		containerEl.createEl('p', { text: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn.' });
-		containerEl.createEl('p', { text: 'Generate an API key with /api generate in Discord DMs with the bot. Scenes are detected when queried; you do not register them by hand.' });
+		containerEl.createEl('p', { text: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn. Auto-create (off by default) only files new tracks after you turn it on, not your existing tracker history.' });
+		containerEl.createEl('p', { text: 'Generate an API key with /api generate in Discord DMs with the bot.' });
+	}
+
+	private listKnownGuildIds(): string[] {
+		return Array.from(new Set([
+			...Object.keys(this.plugin.settings.guildFolderMap || {}),
+			...Object.keys(this.plugin.settings.guildNameCache || {}),
+		])).filter((guildId) => /^\d+$/.test(guildId) && guildId !== '0')
+			.sort((a, b) => {
+				const nameA = this.plugin.settings.guildNameCache[a] || a;
+				const nameB = this.plugin.settings.guildNameCache[b] || b;
+				return nameA.localeCompare(nameB, undefined, { sensitivity: 'base' });
+			});
+	}
+
+	private serverFolderSettingsDesc(): string {
+		const scenesFolder = this.plugin.settings.scenesFolder || 'RP Scenes';
+		return this.listKnownGuildIds().length > 0
+			? `Folder under "${scenesFolder}" for each Discord server. Nested folders (months, partners) stay manual.`
+			: `Folders appear here after Load servers, a poll, or Import now. Matching existing folders under "${scenesFolder}" is case-insensitive.`;
+	}
+
+	private serverFolderSettingItems(): Array<{
+		name: string;
+		desc: string;
+		render: (setting: Setting) => void;
+	}> {
+		return this.listKnownGuildIds().map((guildId) => {
+			const label = this.plugin.settings.guildNameCache[guildId] || guildId;
+			return {
+				name: label,
+				desc: `Server ${guildId}`,
+				render: (setting: Setting) => {
+					setting.addText(text => text
+						.setPlaceholder('For The Greeks')
+						.setValue(this.plugin.settings.guildFolderMap[guildId] || '')
+						.onChange(async (value) => {
+							const folder = value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+							if (folder) {
+								this.plugin.settings.guildFolderMap[guildId] = folder;
+							} else {
+								delete this.plugin.settings.guildFolderMap[guildId];
+							}
+							await this.plugin.saveSettings();
+						}));
+				},
+			};
+		});
+	}
+
+	private refreshSettingsView(): void {
+		const tab = this as PluginSettingTab & { update?: () => void };
+		if (typeof tab.update === 'function') {
+			tab.update();
+			return;
+		}
+		this.display();
+	}
+
+	private async refreshServerFolderList(): Promise<void> {
+		if (!this.plugin.settings.apiKey) {
+			new Notice('API key must be configured in settings.');
+			return;
+		}
+		const userId = await this.plugin.getPrimaryUserId();
+		if (!userId) {
+			new Notice('Failed to get user ID from API key. Please check your API key.');
+			return;
+		}
+		try {
+			const trackedUrl = `${this.plugin.getBotApiUrl()}/api/v1/threads/tracked?user_id=${userId}`;
+			const trackedResponse = await requestUrl({
+				url: trackedUrl,
+				method: 'GET',
+				headers: this.plugin.getApiHeaders(),
+				throw: false,
+			});
+			if (trackedResponse.status !== 200) {
+				this.plugin.handleApiError(trackedResponse, 'refreshServerFolderList');
+				new Notice('Failed to load servers from tracker.');
+				return;
+			}
+			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
+			for (const thread of trackedData.threads || []) {
+				const guildId = thread.guild_id != null ? String(thread.guild_id).trim() : '';
+				if (!isUsableGuildId(guildId)) {
+					continue;
+				}
+				if (thread.guild_name) {
+					this.plugin.rememberGuildName(guildId, thread.guild_name);
+				} else if (!this.plugin.settings.guildNameCache[guildId]) {
+					this.plugin.settings.guildNameCache[guildId] = guildId;
+				}
+			}
+			await this.plugin.saveSettings();
+			const count = this.listKnownGuildIds().length;
+			this.refreshSettingsView();
+			if (count === 0) {
+				new Notice('No Discord servers on your tracker yet.');
+			} else {
+				new Notice(`${count} server(s) ready for folder mapping.`);
+			}
+		} catch (error) {
+			new Notice(`Failed to load servers: ${getErrorMessage(error)}`);
+		}
+	}
+
+	private renderServerFolderSettings(containerEl: HTMLElement): void {
+		const guildIds = this.listKnownGuildIds();
+
+		new Setting(containerEl)
+			.setName('Server folders')
+			.setDesc(this.serverFolderSettingsDesc());
+
+		for (const guildId of guildIds) {
+			const label = this.plugin.settings.guildNameCache[guildId] || guildId;
+			new Setting(containerEl)
+				.setName(label)
+				.setDesc(`Server ${guildId}`)
+				.addText(text => text
+					.setPlaceholder('For The Greeks')
+					.setValue(this.plugin.settings.guildFolderMap[guildId] || '')
+					.onChange(async (value) => {
+						const folder = value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+						if (folder) {
+							this.plugin.settings.guildFolderMap[guildId] = folder;
+						} else {
+							delete this.plugin.settings.guildFolderMap[guildId];
+						}
+						await this.plugin.saveSettings();
+					}));
+		}
 	}
 
 	private async setPollingEnabled(value: boolean): Promise<void> {
 		this.plugin.settings.enabled = value;
 		await this.plugin.saveSettings();
-		if (value) {
+		if (value || this.plugin.settings.autoCreateFromTracker) {
 			this.plugin.startPolling();
 		} else {
 			this.plugin.stopPolling();
@@ -2792,12 +3719,14 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		this.plugin.settings.cachedUserId = '';
 		await this.plugin.saveSettings();
 		if (!value.trim()) {
+			this.plugin.syncTrackerLiveConnection();
 			return;
 		}
 		const userId = await this.plugin.getUserIdFromApiKey();
 		if (userId) {
 			new Notice(`User ID detected: ${userId}`);
 			await this.plugin.syncMuses();
+			this.plugin.syncTrackerLiveConnection();
 			if (this.plugin.settings.enabled) {
 				this.plugin.stopPolling();
 				this.plugin.startPolling();

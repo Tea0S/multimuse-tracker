@@ -6,12 +6,13 @@ An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Trac
 ## Features
 
 - ✅ **Automatic Thread Tracking**: Automatically tracks Discord threads linked in your scene files
+- ✅ **Import from Tracker**: Auto-create scene notes for threads you `/track add` or that StageHand opens, filed under the Discord server's folder
 - ✅ **Send as Muse**: Post selected text as a muse to Discord (command palette, mobile toolbar, or selection menu)
 - ✅ **Auto-Detected User ID**: Automatically detects your Discord user ID from your API key (no manual configuration needed)
 - ✅ **Scene Creation**: Create new scene files with muse selection, folder organization, and automatic property tracking
 - ✅ **Sync from Tracker**: Import tracked threads from the bot and create scene files
 - ✅ **Property Tracking**: Automatically adds "Roleplay" and "Is Active?" properties based on folder structure
-- ✅ **Configurable Polling**: Automatically checks Discord threads for new replies (5-60 minute intervals)
+- ✅ **Configurable Polling**: Automatically checks Discord threads for new replies (5-60 minute intervals). New tracked scenes create notes immediately when auto-create is on.
 - ✅ **Frontmatter Updates**: Automatically updates `Replied?` based on thread state. `Participants` is always user-editable (plugin does not overwrite it).
 
 ## Installation
@@ -72,9 +73,13 @@ You can run **Initialize MultiMuse workspace** again only after removing or rena
 
 ### Syncing from Tracker
 
-1. Use the command **"Sync from Tracker"**
-2. For each tracked thread, select the folder location
-3. Scene files will be created automatically with frontmatter populated from the bot
+1. Turn on **Auto-create notes from tracker** in settings (off by default)
+2. The next poll snapshots your current tracker so **existing history is not imported**
+3. After that, new `/track add` threads and StageHand scene opens get a note under `RP Scenes/<server folder>/` (on the next poll, or immediately if live events are connected)
+4. Use **Import unfiled tracked scenes** for threads that are already open and not in the vault yet
+5. Map Discord servers to folders in **Server folders** (use **Load servers from tracker** if the list is empty). Nested folders (months, partners, plot) stay manual — move the note after it is created
+
+**Import unfiled tracked scenes** creates notes only for **open, unarchived** Discord threads that are not already in the vault. Ended or archived tracks are skipped.
 
 ### Sending Messages as Muse
 
@@ -123,6 +128,7 @@ Created: 2024-01-15
 - **Check Discord Threads Now**: Manually trigger a check for all scenes
 - **Toggle Discord Polling**: Enable/disable automatic polling
 - **Create New Scene**: Create a new scene file with muse selection
+- **Import unfiled tracked scenes**: Create notes for open (unarchived) tracked threads that do not already have a scene file
 - **Send as Muse**: Post the selected text to the Discord thread as a muse
 - **Insert @ mention**: Insert a Discord `<@userId>` mention at the cursor
 - **Sync from Tracker**: Sync scenes from bot tracker to Obsidian
@@ -135,6 +141,8 @@ Created: 2024-01-15
 - **Poll Interval**: How often to check (5-60 minutes)
 - **Scenes Folder**: Folder containing your scene files
 - **Obsidian Base Path**: Optional path to Base file for scene tracking
+- **Auto-create notes from tracker**: After you opt in, only *new* tracks/StageHand opens get notes (not existing history)
+- **Server folders**: Discord server → folder under your scenes folder
 
 ### Scene Properties
 - **Track Roleplay Property**: Automatically add "Roleplay" property from folder path
@@ -188,6 +196,11 @@ Created: 2024-01-15
 - Verify the muse exists in Discord
 - Check that the muse is owned by you or shared with you
 
+### New tracker scenes are not creating notes
+- **Auto-create notes from tracker** must stay on (it no longer turns itself off after a reload)
+- Existing open threads are never dumped into the vault automatically — use **Import unfiled tracked scenes** for those
+- Auto-create still runs if Discord polling is off. While it is on, the plugin also checks for new tracks about once a minute.
+
 ### Files not updating
 - Check that your scene files have `Link` and `Characters` fields in frontmatter
 - Verify the link contains a valid Discord thread URL
@@ -203,10 +216,9 @@ Created: 2024-01-15
 - Verify your API key is configured correctly
 
 ### Scenes marked as "Replied?" incorrectly
-- This can happen if the bot doesn't have access to the channel (403 Forbidden)
-- The plugin includes safeguards to prevent incorrect updates
+- Polling copies the Discord tracker: checked means you already posted, unchecked means it is your turn
 - Newly created scenes are protected from immediate updates for 60 seconds
-- Check the bot console for access errors
+- If a note is open in Properties, reload the plugin after updating so the checkbox can refresh
 
 ### Rate Limiting
 - Discord API has rate limits
