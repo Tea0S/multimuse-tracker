@@ -76,10 +76,10 @@ You can run **Initialize MultiMuse workspace** again only after removing or rena
 1. Turn on **Auto-create notes from tracker** in settings (off by default)
 2. The next poll snapshots your current tracker so **existing history is not imported**
 3. After that, new `/track add` threads and StageHand scene opens get a note under `RP Scenes/<server folder>/` (on the next poll, or immediately if live events are connected)
-4. Use **Import unfiled tracked scenes** for threads that are already open and not in the vault yet
+4. Use **Import unfiled tracked scenes** for threads that are already open and not in the vault yet. A new StageHand scene in a **persistent hub** also creates a new note even if that Discord thread was imported before (older hub notes are marked inactive).
 5. Map Discord servers to folders in **Server folders** (use **Load servers from tracker** if the list is empty). Nested folders (months, partners, plot) stay manual — move the note after it is created
 
-**Import unfiled tracked scenes** creates notes only for **open, unarchived** Discord threads that are not already in the vault. Ended or archived tracks are skipped.
+**Import unfiled tracked scenes** creates notes for **open, unarchived** Discord threads that do not already have a scene file **for the current scene name**. Ended or archived tracks are skipped. Persistent hubs reuse one Discord thread for many scenes; each new hub scene name gets its own note.
 
 ### Sending Messages as Muse
 
@@ -200,6 +200,7 @@ Created: 2024-01-15
 - **Auto-create notes from tracker** must stay on (it no longer turns itself off after a reload)
 - Existing open threads are never dumped into the vault automatically — use **Import unfiled tracked scenes** for those
 - Auto-create still runs if Discord polling is off. While it is on, the plugin also checks for new tracks about once a minute.
+- Persistent hub scenes use the StageHand scene name, not the Discord thread title. A new hub scene creates a new note; the previous note for that thread is marked inactive.
 
 ### Files not updating
 - Check that your scene files have `Link` and `Characters` fields in frontmatter

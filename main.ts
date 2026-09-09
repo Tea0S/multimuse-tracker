@@ -18,7 +18,7 @@ interface MultimuseObsidianSettings {
 	autoCreateFromTracker: boolean;
 	/** True after the current tracker list has been snapshotted so auto-create will not backfill. */
 	trackerImportSeeded: boolean;
-	/** Thread ids already seen; auto-create only files ids that appear after the snapshot. */
+	/** Thread ids already seen; auto-create files new ids, plus new StageHand hub scene names on a reused thread. */
 	trackerSeenThreadIds: string[];
 	/** Discord guild id -> folder under scenesFolder (e.g. "The Scarlet Compact"). */
 	guildFolderMap: Record<string, string>;
@@ -55,7 +55,7 @@ interface MuseInfo {
 	tags: string;
 	owner_id: number;
 	is_shared: boolean;
-	muse_id?: string | null; // Optional: for API calls (alias-safe); display always uses name
+	muse_id?: string | null; // Optional: for API calls (alias-safe)
 }
 
 type FrontmatterData = Record<string, unknown>;
@@ -222,6 +222,67 @@ function sortMusesAlphabetically(muses: MuseInfo[]): MuseInfo[] {
 	return [...muses].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 }
 
+function museDisplayName(muse: MuseInfo): string {
+	return (muse.name || '').trim() || '?';
+}
+
+/** Pretty-print muse tags the same way Discord duplicate labels do. */
+function formatMuseTagsLabel(tags: string): string {
+	return tags
+		.split(',')
+		.map((tag) => tag.trim())
+		.filter((tag) => tag.length > 0)
+		.join(', ');
+}
+
+/**
+ * Duplicate names get `(tags)` or `(1)` / `(2)` — same rules as MultiMuse
+ * `display_labels_for_proxies` in the Discord client.
+ */
+function displayLabelsForMuses(muses: MuseInfo[]): string[] {
+	const nameCounts: Record<string, number> = {};
+	for (const muse of muses) {
+		const name = museDisplayName(muse);
+		nameCounts[name] = (nameCounts[name] || 0) + 1;
+	}
+	const nameUsed: Record<string, number> = {};
+	return muses.map((muse) => {
+		const name = museDisplayName(muse);
+		if ((nameCounts[name] || 0) <= 1) {
+			return name;
+		}
+		const tags = formatMuseTagsLabel(muse.tags || '');
+		if (tags) {
+			return `${name} (${tags})`.slice(0, 100);
+		}
+		nameUsed[name] = (nameUsed[name] || 0) + 1;
+		return `${name} (${nameUsed[name]})`;
+	});
+}
+
+function museNamesEqual(a: string, b: string): boolean {
+	return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function museLabelInList(muses: MuseInfo[], muse: MuseInfo | undefined, fallback: string): string {
+	if (!muse) {
+		return fallback;
+	}
+	const index = muses.indexOf(muse);
+	if (index < 0) {
+		return museDisplayName(muse);
+	}
+	return displayLabelsForMuses(muses)[index] || museDisplayName(muse);
+}
+
+function musesLookLikeSameCopy(a: MuseInfo, b: MuseInfo): boolean {
+	if (a.muse_id && b.muse_id) {
+		return a.muse_id === b.muse_id;
+	}
+	return museNamesEqual(a.name, b.name)
+		&& formatMuseTagsLabel(a.tags || '').toLowerCase() === formatMuseTagsLabel(b.tags || '').toLowerCase();
+}
+
 function metadataFingerprint(characters: string[], participants: number): string {
 	return `${sortNamesAlphabetically(characters).join('\x1f')}|${participants}`;
 }
@@ -244,6 +305,18 @@ function sanitizeNoteTitle(name: string): string {
 		.trim()
 		.slice(0, 120);
 	return cleaned || 'Untitled scene';
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** True when a note basename is this scene title, including "Title 2" copies from uniqueSceneFilePath. */
+function noteBasenameMatchesSceneTitle(basename: string, title: string): boolean {
+	if (basename === title) {
+		return true;
+	}
+	return new RegExp(`^${escapeRegExp(title)} \\d+$`).test(basename);
 }
 
 function discordThreadUrl(guildId: string, threadId: string): string {
@@ -769,6 +842,20 @@ export default class MultimuseObsidian extends Plugin {
 		this.pendingLiveCreates.set(threadId, { thread: merged, timer });
 	}
 
+	private preferredLiveSceneName(a: TrackedThread, b: TrackedThread): string | undefined {
+		const discordName = (b.thread_name || a.thread_name || '').trim();
+		for (const candidate of [b.scene_name, a.scene_name]) {
+			const scene = (candidate || '').trim();
+			if (!scene || /^Thread \d+$/i.test(scene)) {
+				continue;
+			}
+			if (!discordName || scene !== discordName) {
+				return scene;
+			}
+		}
+		return (b.scene_name || a.scene_name || '').trim() || undefined;
+	}
+
 	private mergeTrackedThreads(a: TrackedThread, b: TrackedThread): TrackedThread {
 		const names = [...new Set([
 			...this.trackedThreadCharacters(a),
@@ -783,7 +870,7 @@ export default class MultimuseObsidian extends Plugin {
 			muse_names: names,
 			guild_name: b.guild_name || a.guild_name,
 			thread_name: b.thread_name || a.thread_name,
-			scene_name: b.scene_name || a.scene_name,
+			scene_name: this.preferredLiveSceneName(a, b),
 			participants: Math.max(
 				!isNaN(participantsA) ? participantsA : 0,
 				!isNaN(participantsB) ? participantsB : 0,
@@ -1032,13 +1119,89 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	findMuseMatch(muses: MuseInfo[], selectedMuse: string): MuseInfo | undefined {
-		const selectedLower = selectedMuse.toLowerCase().trim();
-		return muses.find(m => {
-			const museLower = m.name.toLowerCase().trim();
-			return museLower === selectedLower
-				|| museLower.includes(selectedLower)
-				|| selectedLower.includes(museLower);
-		});
+		const selected = selectedMuse.trim();
+		if (!selected) {
+			return undefined;
+		}
+		const labels = displayLabelsForMuses(muses);
+		const selectedLower = selected.toLowerCase();
+		const labelHits = muses.filter((_, index) => labels[index].toLowerCase() === selectedLower);
+		if (labelHits.length === 1) {
+			return labelHits[0];
+		}
+		const exactNameHits = muses.filter((muse) => museNamesEqual(muse.name, selected));
+		if (exactNameHits.length === 1) {
+			return exactNameHits[0];
+		}
+		if (exactNameHits.length > 1) {
+			return exactNameHits[0];
+		}
+		const paren = selected.match(/^(.*) \((.*)\)\s*$/);
+		if (paren) {
+			const baseName = paren[1].trim();
+			const tagPart = paren[2].trim().toLowerCase();
+			const named = muses.filter((muse) => museNamesEqual(muse.name, baseName));
+			const tagHit = named.find((muse) => {
+				const pretty = formatMuseTagsLabel(muse.tags || '').toLowerCase();
+				const raw = (muse.tags || '').trim().toLowerCase();
+				return pretty === tagPart || raw === tagPart;
+			});
+			if (tagHit) {
+				return tagHit;
+			}
+		}
+		return undefined;
+	}
+
+	findMuseMatchesByName(muses: MuseInfo[], selectedMuse: string): MuseInfo[] {
+		return muses.filter((muse) => museNamesEqual(muse.name, selectedMuse));
+	}
+
+	async suggestMuse(muses: MuseInfo[], title = 'Select a muse'): Promise<MuseInfo | null> {
+		if (muses.length === 0) {
+			return null;
+		}
+		if (muses.length === 1) {
+			return muses[0];
+		}
+		const labels = displayLabelsForMuses(muses);
+		const selectedIndex = await this.showSuggester(labels, labels, title);
+		if (selectedIndex === null || selectedIndex < 0) {
+			return null;
+		}
+		return muses[selectedIndex];
+	}
+
+	async resolveMuseForPost(muses: MuseInfo[], selectedMuse: string): Promise<{ muse?: MuseInfo; cancelled: boolean }> {
+		const selected = selectedMuse.trim();
+		if (!selected) {
+			return { cancelled: false };
+		}
+		const labels = displayLabelsForMuses(muses);
+		const selectedLower = selected.toLowerCase();
+		const labelHits = muses.filter((_, index) => labels[index].toLowerCase() === selectedLower);
+		if (labelHits.length === 1) {
+			return { muse: labelHits[0], cancelled: false };
+		}
+		const nameHits = this.findMuseMatchesByName(muses, selected);
+		if (nameHits.length > 1) {
+			const picked = await this.suggestMuse(nameHits, `Select which "${nameHits[0].name}"`);
+			if (!picked) {
+				return { cancelled: true };
+			}
+			return { muse: picked, cancelled: false };
+		}
+		if (nameHits.length === 1) {
+			return { muse: nameHits[0], cancelled: false };
+		}
+		if (labelHits.length > 1) {
+			const picked = await this.suggestMuse(labelHits, 'Select a muse');
+			if (!picked) {
+				return { cancelled: true };
+			}
+			return { muse: picked, cancelled: false };
+		}
+		return { muse: this.findMuseMatch(muses, selected), cancelled: false };
 	}
 
 	async resolveMuseWrappers(
@@ -1849,18 +2012,60 @@ export default class MultimuseObsidian extends Plugin {
 		return active;
 	}
 
-	/** Build a map of thread_id (from Link property) -> TFile for all scene files that have a valid Link. */
-	getExistingSceneLinksByThreadId(): Map<string, TFile> {
-		const map = new Map<string, TFile>();
+	/** Build a map of thread_id (from Link property) -> every scene note that links that Discord thread. */
+	getExistingSceneFilesByThreadId(): Map<string, TFile[]> {
+		const map = new Map<string, TFile[]>();
 		for (const file of this.getSceneFiles()) {
 			const cache = this.app.metadataCache.getFileCache(file);
 			const frontmatter = this.getFrontmatter(cache);
 			const link = frontmatter?.['Link'];
 			if (!link || typeof link !== 'string') continue;
 			const threadId = this.extractThreadIdFromUrl(link);
-			if (threadId) map.set(threadId, file);
+			if (!threadId) continue;
+			const list = map.get(threadId) || [];
+			list.push(file);
+			map.set(threadId, list);
 		}
 		return map;
+	}
+
+	/** One note per thread, preferring an active note when a persistent hub has several. */
+	getExistingSceneLinksByThreadId(): Map<string, TFile> {
+		const map = new Map<string, TFile>();
+		for (const [threadId, files] of this.getExistingSceneFilesByThreadId()) {
+			const active = files.filter((file) => {
+				const cache = this.app.metadataCache.getFileCache(file);
+				const frontmatter = this.getFrontmatter(cache);
+				return !!(frontmatter && this.isSceneMarkedActive(frontmatter));
+			});
+			map.set(threadId, active[active.length - 1] || files[files.length - 1]);
+		}
+		return map;
+	}
+
+	noteMatchesSceneTitle(file: TFile, title: string): boolean {
+		return noteBasenameMatchesSceneTitle(file.basename, title);
+	}
+
+	threadHasNoteForTitle(files: TFile[], title: string): boolean {
+		return files.some((file) => this.noteMatchesSceneTitle(file, title));
+	}
+
+	async deactivatePriorSceneNotes(files: TFile[], keepTitle: string): Promise<void> {
+		if (!this.settings.trackIsActive) {
+			return;
+		}
+		for (const file of files) {
+			if (this.noteMatchesSceneTitle(file, keepTitle)) {
+				continue;
+			}
+			const cache = this.app.metadataCache.getFileCache(file);
+			const frontmatter = this.getFrontmatter(cache);
+			if (!frontmatter || !this.isSceneMarkedActive(frontmatter)) {
+				continue;
+			}
+			await this.updateFrontmatter(file, 'Is Active?', false);
+		}
 	}
 
 	markFileRecentlyCreated(filePath: string): void {
@@ -1948,14 +2153,27 @@ export default class MultimuseObsidian extends Plugin {
 
 	trackedThreadTitle(thread: TrackedThread): string {
 		const fromScene = (thread.scene_name || '').trim();
+		const fromThread = (thread.thread_name || '').trim();
 		if (fromScene && !/^Thread \d+$/i.test(fromScene)) {
 			return sanitizeNoteTitle(fromScene);
 		}
-		const fromThread = (thread.thread_name || '').trim();
 		if (fromThread && !/^Thread \d+$/i.test(fromThread)) {
 			return sanitizeNoteTitle(fromThread);
 		}
 		return 'Untitled scene';
+	}
+
+	/** True when StageHand sent a scene title that is not the Discord hub/thread name. */
+	hasDistinctSceneName(thread: TrackedThread): boolean {
+		const scene = sanitizeNoteTitle((thread.scene_name || '').trim());
+		if (!scene || scene === 'Untitled scene') {
+			return false;
+		}
+		const discordName = sanitizeNoteTitle((thread.thread_name || '').trim());
+		if (!discordName || discordName === 'Untitled scene') {
+			return true;
+		}
+		return scene !== discordName;
 	}
 
 	isLiveActiveScene(thread: TrackedThread): boolean {
@@ -1963,6 +2181,10 @@ export default class MultimuseObsidian extends Plugin {
 			return false;
 		}
 		if (thread.archived === false) {
+			return true;
+		}
+		const scene = (thread.scene_name || '').trim();
+		if (scene && !/^Thread \d+$/i.test(scene)) {
 			return true;
 		}
 		const name = (thread.thread_name || '').trim();
@@ -2084,7 +2306,7 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		const seen = new Set(this.settings.trackerSeenThreadIds || []);
-		const existing = this.getExistingSceneLinksByThreadId();
+		const existingByThread = this.getExistingSceneFilesByThreadId();
 		let createdCount = 0;
 		let settingsDirty = false;
 		const previousCreationLock = this.sceneCreationInProgress;
@@ -2101,19 +2323,12 @@ export default class MultimuseObsidian extends Plugin {
 				if (this.rememberGuildName(guildId, thread.guild_name)) {
 					settingsDirty = true;
 				}
-				if (opts.mode === 'new' && seen.has(threadId)) {
-					continue;
-				}
 				if (thread.archived === true) {
 					seen.add(threadId);
 					settingsDirty = true;
 					continue;
 				}
 				if (opts.mode === 'backfill' && !this.isLiveActiveScene(thread)) {
-					continue;
-				}
-				if (existing.has(threadId)) {
-					seen.add(threadId);
 					continue;
 				}
 
@@ -2124,6 +2339,23 @@ export default class MultimuseObsidian extends Plugin {
 
 				const title = this.trackedThreadTitle(thread);
 				if (title === 'Untitled scene') {
+					continue;
+				}
+
+				const filesForThread = existingByThread.get(threadId) || [];
+				if (this.threadHasNoteForTitle(filesForThread, title)) {
+					seen.add(threadId);
+					continue;
+				}
+				// Reused persistent hub: only file a second note when StageHand sent a
+				// scene_name that is not the Discord thread title.
+				if (filesForThread.length > 0 && !this.hasDistinctSceneName(thread)) {
+					seen.add(threadId);
+					continue;
+				}
+				// Snapshotted tracker history with no vault note stays unfiled unless the user
+				// runs Import. A reused persistent hub (same thread, new scene_name) still files.
+				if (opts.mode === 'new' && seen.has(threadId) && filesForThread.length === 0) {
 					continue;
 				}
 
@@ -2157,8 +2389,12 @@ export default class MultimuseObsidian extends Plugin {
 				}
 
 				this.markFileRecentlyCreated(filePath);
+				if (filesForThread.length > 0) {
+					await this.deactivatePriorSceneNotes(filesForThread, title);
+				}
 				const createdFile = await this.app.vault.create(filePath, this.formatFrontmatterYaml(frontmatter));
-				existing.set(threadId, createdFile);
+				filesForThread.push(createdFile);
+				existingByThread.set(threadId, filesForThread);
 				seen.add(threadId);
 
 				try {
@@ -2374,14 +2610,12 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		muses.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+		muses = sortMusesAlphabetically(muses);
 
-		// 2) Select muse
-		const museOptions = muses.map(m => m.name);
-		const selectedMuseIndex = await this.showSuggester(museOptions, museOptions, 'Select a muse');
-		if (selectedMuseIndex === null || selectedMuseIndex < 0) return;
-
-		const selectedMuse = muses[selectedMuseIndex];
+		// 2) Select muse — duplicate names use the same (tags) labels as Discord
+		const selectedMuse = await this.suggestMuse(muses, 'Select a muse');
+		if (!selectedMuse) return;
+		const selectedLabel = museLabelInList(muses, selectedMuse, selectedMuse.name);
 
 		// 3) Get Discord thread/channel link
 		const threadUrl = await this.showInputPrompt('Enter Discord thread/channel URL');
@@ -2394,7 +2628,7 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		// 4) Get location (RP folder) - pass muse name for context
-		const location = await this.selectSceneLocation(`muse "${selectedMuse.name}"`);
+		const location = await this.selectSceneLocation(`muse "${selectedLabel}"`);
 		if (!location) return;
 
 		// 5) Get scene name
@@ -3129,23 +3363,36 @@ export default class MultimuseObsidian extends Plugin {
 			selectedMuse = characters[museIndex];
 		}
 
-		this.lastEditorSelection = '';
-		new Notice(`Sending as ${selectedMuse}…`);
-
 		const primaryUserId = this.settings.cachedUserId || await this.getPrimaryUserId();
 		if (!primaryUserId) {
 			new Notice('Failed to get user ID from API key. Please check your API key in settings.');
 			return;
 		}
 
+		let muses = this.museCache.get(primaryUserId) ?? [];
+		if (muses.length === 0) {
+			muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
+		} else {
+			void this.syncMuses();
+		}
+		const resolved = await this.resolveMuseForPost(muses, selectedMuse);
+		if (resolved.cancelled) {
+			return;
+		}
+		const matchedMuse = resolved.muse;
+		const sendAsLabel = museLabelInList(muses, matchedMuse, selectedMuse);
+
+		this.lastEditorSelection = '';
+		new Notice(`Sending as ${sendAsLabel}…`);
+
 		const postBody: Record<string, unknown> = {
 			thread_id: threadId,
-			muse_name: selectedMuse,
+			muse_name: matchedMuse?.name || selectedMuse,
 			content: selection.trim(),
 			user_id: primaryUserId,
 		};
 
-		void this.deliverPostAsMuse(selectedMuse, primaryUserId, threadId, postBody, file);
+		void this.deliverPostAsMuse(matchedMuse?.name || selectedMuse, primaryUserId, threadId, postBody, file, matchedMuse);
 	}
 
 	private async applyMuseWrappersToPost(
@@ -3173,16 +3420,22 @@ export default class MultimuseObsidian extends Plugin {
 		primaryUserId: string,
 		threadId: string,
 		postBody: Record<string, unknown>,
-		sceneFile?: TFile
+		sceneFile?: TFile,
+		resolvedMuse?: MuseInfo
 	): Promise<void> {
 		try {
 			await this.yieldPollSlot();
 
 			let muses = this.museCache.get(primaryUserId) ?? [];
-			let matchedMuse = this.findMuseMatch(muses, selectedMuse);
+			let matchedMuse = resolvedMuse ?? this.findMuseMatch(muses, selectedMuse);
 			if (!matchedMuse?.muse_id) {
 				muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
-				matchedMuse = this.findMuseMatch(muses, selectedMuse);
+				const alreadyResolved = resolvedMuse;
+				if (alreadyResolved) {
+					matchedMuse = muses.find((muse) => musesLookLikeSameCopy(muse, alreadyResolved)) ?? alreadyResolved;
+				} else {
+					matchedMuse = this.findMuseMatch(muses, selectedMuse);
+				}
 			}
 			if (matchedMuse?.muse_id) {
 				postBody.muse_id = matchedMuse.muse_id;
@@ -3217,13 +3470,13 @@ export default class MultimuseObsidian extends Plugin {
 					}
 					response = await this.apiPostJson('/api/v1/messages/post', postBody);
 				} else if (muses.length > 0) {
-					new Notice(`Muse "${selectedMuse}" not found. Available: ${muses.map(m => m.name).join(', ')}`);
+					new Notice(`Muse "${selectedMuse}" not found. Available: ${displayLabelsForMuses(muses).join(', ')}`);
 					return;
 				}
 			}
 
 			if (response.status === 200 || response.status === 202) {
-				new Notice(`Message sent as ${selectedMuse}!`);
+				new Notice(`Message sent as ${museLabelInList(muses, matchedMuse, selectedMuse)}!`);
 				if (sceneFile) {
 					await this.updateFrontmatter(sceneFile, 'Replied?', true);
 				}
@@ -3291,7 +3544,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: 'Auto-create notes from tracker',
-						desc: 'After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported.',
+						desc: 'After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported. A new scene in a persistent hub still gets a new note.',
 						render: (setting: Setting) => {
 							setting.addToggle(toggle => toggle
 								.setValue(this.plugin.settings.autoCreateFromTracker)
@@ -3300,7 +3553,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 					},
 					{
 						name: 'Import unfiled tracked scenes',
-						desc: 'Create notes for open (unarchived) tracked threads that are not already in the vault.',
+						desc: 'Create notes for open (unarchived) tracked threads that are not already in the vault. A new StageHand scene in a persistent hub creates a new note even if that thread was imported before.',
 						action: () => {
 							void this.plugin.importUnfiledTrackedScenesNow();
 						},
@@ -3458,14 +3711,14 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Auto-create notes from tracker')
-			.setDesc('After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported.')
+			.setDesc('After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported. A new scene in a persistent hub still gets a new note.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.autoCreateFromTracker)
 				.onChange(value => void this.plugin.onAutoCreateFromTrackerChanged(value)));
 
 		new Setting(containerEl)
 			.setName('Import unfiled tracked scenes')
-			.setDesc('Create notes for open (unarchived) tracked threads that are not already in the vault.')
+			.setDesc('Create notes for open (unarchived) tracked threads that are not already in the vault. A new StageHand scene in a persistent hub creates a new note even if that thread was imported before.')
 			.addButton(button => button
 				.setButtonText('Import now')
 				.onClick(() => {
