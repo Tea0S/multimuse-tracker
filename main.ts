@@ -1577,7 +1577,8 @@ export default class MultimuseObsidian extends Plugin {
 
 		const charactersParam = characters.join(',');
 		const participants = this.parseParticipantsFromFrontmatter(frontmatter);
-		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}&participants=${participants}`;
+		const forceQ = opts?.force ? '&force=1' : '';
+		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}&participants=${participants}${forceQ}`;
 
 		const queryResponse = await this.enqueuePollGet(() => requestUrl({
 			url: queryUrl,
@@ -1664,7 +1665,8 @@ export default class MultimuseObsidian extends Plugin {
 			if (!primaryUserId) {
 				return false;
 			}
-			const url = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}&participants=${this.parseParticipantsFromFrontmatter(frontmatter)}`;
+			const forceQ = opts?.force ? '&force=1' : '';
+			const url = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}&participants=${this.parseParticipantsFromFrontmatter(frontmatter)}${forceQ}`;
 
 			const response = await this.enqueuePollGet(() => requestUrl({
 				url: url,
@@ -2165,11 +2167,19 @@ export default class MultimuseObsidian extends Plugin {
 
 	/** True when StageHand sent a scene title that is not the Discord hub/thread name. */
 	hasDistinctSceneName(thread: TrackedThread): boolean {
-		const scene = sanitizeNoteTitle((thread.scene_name || '').trim());
+		const sceneRaw = (thread.scene_name || '').trim();
+		if (!sceneRaw || /^Thread \d+$/i.test(sceneRaw)) {
+			return false;
+		}
+		const scene = sanitizeNoteTitle(sceneRaw);
 		if (!scene || scene === 'Untitled scene') {
 			return false;
 		}
-		const discordName = sanitizeNoteTitle((thread.thread_name || '').trim());
+		const discordRaw = (thread.thread_name || '').trim();
+		if (!discordRaw || /^Thread \d+$/i.test(discordRaw)) {
+			return true;
+		}
+		const discordName = sanitizeNoteTitle(discordRaw);
 		if (!discordName || discordName === 'Untitled scene') {
 			return true;
 		}
@@ -2355,7 +2365,12 @@ export default class MultimuseObsidian extends Plugin {
 				}
 				// Snapshotted tracker history with no vault note stays unfiled unless the user
 				// runs Import. A reused persistent hub (same thread, new scene_name) still files.
-				if (opts.mode === 'new' && seen.has(threadId) && filesForThread.length === 0) {
+				if (
+					opts.mode === 'new'
+					&& seen.has(threadId)
+					&& filesForThread.length === 0
+					&& !this.hasDistinctSceneName(thread)
+				) {
 					continue;
 				}
 

@@ -1,7 +1,7 @@
 {
 	"id": "multimuse-tracker",
 	"name": "Multimuse Tracker",
-	"version": "1.13.11",
+	"version": "1.13.12",
 	"minAppVersion": "1.4.4",
 	"description": "Roleplay sync tool for use with the MultiMuse bot in discord.",
 	"author": "BackstagePass Group",
