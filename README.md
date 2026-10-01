@@ -30,7 +30,7 @@ Install via the Obsidian plugin library
 ### 2. Configure Plugin
 
 1. Open Obsidian Settings → Multimuse Tracker
-2. Paste your API key in the "API Key" field
+2. Save your API key in the API key field. Obsidian stores it in the keychain, and an existing key is moved there the next time the plugin loads.
 3. Your Discord user ID will be automatically detected from the API key
 4. Adjust paths and property toggles if you want something other than the defaults:
    - **Scenes Folder**: Where scene notes live (default: `RP Scenes`)

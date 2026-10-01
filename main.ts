@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope } from 'obsidian';
+import { Plugin, PluginSettingTab, SecretComponent, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope, type SettingDefinitionItem } from 'obsidian';
 
 interface MultimuseObsidianSettings {
 	botApiUrl: string; // Bot HTTP API URL (hidden from user UI for security)
@@ -8,7 +8,8 @@ interface MultimuseObsidianSettings {
 	ownerId: string; // DEPRECATED: Auto-synced from API key, kept for backward compatibility
 	userIds: string; // DEPRECATED: Auto-synced from API key, kept for backward compatibility
 	enabled: boolean;
-	apiKey: string; // API key for authentication (Bearer token)
+	/** Obsidian keychain secret id. Older installs may still store the raw key until load migrates it. */
+	apiKey: string;
 	cachedUserId: string; // Cached user ID from API key (auto-populated)
 	trackRoleplay: boolean; // Whether to add Roleplay property from folder path
 	trackIsActive: boolean; // Whether to add Is Active? property (defaulting to true)
@@ -48,6 +49,58 @@ const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
 	guildFolderMap: {},
 	guildNameCache: {},
 };
+
+/** Obsidian keychain ids are lowercase letters, digits, and dashes. */
+const KEYCHAIN_SECRET_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const MULTIMUSE_KEYCHAIN_ID = 'multimuse-api-key';
+
+interface KeychainStore {
+	getSecret(id: string): string | null;
+	setSecret(id: string, secret: string): void;
+}
+
+/** Resolve a settings value that is either a keychain id or a legacy plaintext key. */
+function readKeychainSecret(storage: KeychainStore | null | undefined, stored: string): string {
+	const raw = (stored || '').trim();
+	if (!raw) return '';
+	if (!storage) return raw;
+	try {
+		const value = storage.getSecret(raw);
+		if (value != null && value !== '') return value;
+	} catch {
+		return KEYCHAIN_SECRET_ID.test(raw) ? '' : raw;
+	}
+	if (!KEYCHAIN_SECRET_ID.test(raw)) return raw;
+	return '';
+}
+
+/**
+ * Move a plaintext API key into the Obsidian keychain.
+ * Returns the id to save in plugin settings.
+ */
+function migratePlaintextToKeychain(storage: KeychainStore | null | undefined, stored: string, preferredId: string): string {
+	const raw = (stored || '').trim();
+	if (!raw || !storage) return raw;
+	try {
+		if (storage.getSecret(raw) != null) return raw;
+		if (KEYCHAIN_SECRET_ID.test(raw)) return raw;
+		const id = claimKeychainId(storage, preferredId, raw);
+		if (storage.getSecret(id) !== raw) storage.setSecret(id, raw);
+		return id;
+	} catch (error) {
+		console.error('Could not store API key in the Obsidian keychain', error);
+		return raw;
+	}
+}
+
+function claimKeychainId(storage: KeychainStore, preferredId: string, secret: string): string {
+	const existing = storage.getSecret(preferredId);
+	if (existing == null || existing === secret) return preferredId;
+	const imported = `${preferredId}-imported`;
+	const importedExisting = storage.getSecret(imported);
+	if (importedExisting == null || importedExisting === secret) return imported;
+	return `${preferredId}-${Date.now().toString(36)}`;
+}
 
 interface MuseInfo {
 	name: string;
@@ -380,7 +433,7 @@ export default class MultimuseObsidian extends Plugin {
 		this.addSettingTab(new MultimuseObsidianSettingTab(this.app, this));
 
 		// Warm auth + muse cache in background so onload does not block the editor
-		if (this.settings.apiKey) {
+		if (this.getApiKey()) {
 			void this.getUserIdFromApiKey().then(() => {
 				void this.syncMuses();
 				this.syncTrackerLiveConnection();
@@ -388,7 +441,7 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		// Start polling if enabled (first poll deferred so startup stays responsive)
-		if (this.settings.apiKey && (this.settings.enabled || this.settings.autoCreateFromTracker)) {
+		if (this.getApiKey() && (this.settings.enabled || this.settings.autoCreateFromTracker)) {
 			this.startPolling({ deferInitialCheck: true });
 		}
 
@@ -589,10 +642,21 @@ export default class MultimuseObsidian extends Plugin {
 				await this.saveSettings();
 			}
 		}
+		const migratedKey = migratePlaintextToKeychain(this.app.secretStorage, this.settings.apiKey, MULTIMUSE_KEYCHAIN_ID);
+		if (migratedKey !== this.settings.apiKey) {
+			this.settings.apiKey = migratedKey;
+			await this.saveSettings();
+			new Notice('MultiMuse API key moved to the Obsidian keychain.');
+		}
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	/** Bearer token from the Obsidian keychain, or a legacy plaintext key. */
+	getApiKey(): string {
+		return readKeychainSecret(this.app.secretStorage, this.settings.apiKey);
 	}
 
 	startPolling(opts?: { deferInitialCheck?: boolean }) {
@@ -692,8 +756,7 @@ export default class MultimuseObsidian extends Plugin {
 	syncTrackerLiveConnection(): void {
 		const shouldRun = !!(
 			this.settings.autoCreateFromTracker
-			&& this.settings.apiKey
-			&& this.settings.apiKey.trim()
+			&& this.getApiKey()
 			&& this.settings.cachedUserId
 		);
 		this.trackerEventsShouldRun = shouldRun;
@@ -748,7 +811,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	private connectTrackerLiveConnection(): void {
-		if (!this.trackerEventsShouldRun || !this.settings.apiKey) {
+		if (!this.trackerEventsShouldRun || !this.getApiKey()) {
 			return;
 		}
 		if (this.trackerEventsFailCount >= 2 && !this.trackerEventsEverReady) {
@@ -771,7 +834,7 @@ export default class MultimuseObsidian extends Plugin {
 				return;
 			}
 			try {
-				socket.send(JSON.stringify({ type: 'auth', token: this.settings.apiKey.trim() }));
+				socket.send(JSON.stringify({ type: 'auth', token: this.getApiKey() }));
 			} catch {
 				socket.close();
 			}
@@ -907,9 +970,9 @@ export default class MultimuseObsidian extends Plugin {
 			'Content-Type': 'application/json'
 		};
 		
-		// Add Authorization header if API key is configured
-		if (this.settings.apiKey && this.settings.apiKey.trim() !== '') {
-			headers['Authorization'] = `Bearer ${this.settings.apiKey.trim()}`;
+		const apiKey = this.getApiKey();
+		if (apiKey) {
+			headers['Authorization'] = `Bearer ${apiKey}`;
 		}
 		
 		return headers;
@@ -1029,12 +1092,11 @@ export default class MultimuseObsidian extends Plugin {
 	 */
 	async getUserIdFromApiKey(): Promise<string | null> {
 		// If we have a cached user ID and API key is set, use it
-		if (this.settings.cachedUserId && this.settings.apiKey) {
+		if (this.settings.cachedUserId && this.getApiKey()) {
 			return this.settings.cachedUserId;
 		}
-		
-		// If no API key, can't get user ID
-		if (!this.settings.apiKey || this.settings.apiKey.trim() === '') {
+
+		if (!this.getApiKey()) {
 			return null;
 		}
 		
@@ -1241,7 +1303,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async fetchMusesListFromApi(userIds: string[]): Promise<MuseInfo[]> {
-		if (!this.settings.apiKey || userIds.length === 0) {
+		if (!this.getApiKey() || userIds.length === 0) {
 			return [];
 		}
 		const queryParam = `user_ids=${userIds.join(',')}`;
@@ -1265,7 +1327,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	async syncMuses(): Promise<void> {
 		/**Sync muse names from bot API for all configured user IDs.*/
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			return;
 		}
 
@@ -1282,7 +1344,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async pollNewTrackedThreads(): Promise<void> {
-		if (!this.settings.autoCreateFromTracker || !this.settings.apiKey) {
+		if (!this.settings.autoCreateFromTracker || !this.getApiKey()) {
 			return;
 		}
 		const userId = await this.getPrimaryUserId();
@@ -1312,7 +1374,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async checkAllThreads(opts?: { force?: boolean }) {
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			return;
 		}
 		if (!this.settings.enabled && !this.settings.autoCreateFromTracker) {
@@ -1332,7 +1394,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	async checkAllThreadsViaBotApi(opts?: { force?: boolean }): Promise<void> {
 		/**Poll tracked thread paths from the API, then active vault scenes not in the tracker map.*/
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			return;
 		}
 
@@ -1779,7 +1841,7 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		if (!this.settings.apiKey || !this.settings.enabled) {
+		if (!this.getApiKey() || !this.settings.enabled) {
 			return;
 		}
 
@@ -2256,7 +2318,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async importUnfiledTrackedScenesNow(): Promise<void> {
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			new Notice('API key must be configured in settings.');
 			return;
 		}
@@ -2557,7 +2619,7 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			new Notice('API key must be configured in settings.');
 			return;
 		}
@@ -3280,7 +3342,7 @@ export default class MultimuseObsidian extends Plugin {
 			new Notice('Link is not a valid Discord channel URL (could not get server ID).');
 			return;
 		}
-		if (!this.settings.apiKey) {
+		if (!this.getApiKey()) {
 			new Notice('API key required in plugin settings to fetch server members.');
 			return;
 		}
@@ -3514,7 +3576,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 	}
 
 	/** 1.13.0+: Obsidian renders this and skips display(). Also indexes settings search. */
-	getSettingDefinitions() {
+	getSettingDefinitions(): SettingDefinitionItem[] {
 		return [
 			{
 				name: 'Enable polling',
@@ -3614,14 +3676,10 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 			},
 			{
 				name: 'API key',
-				desc: 'Generate one with /api generate in Discord DMs with the MultiMuse bot. Your user ID is detected from the key.',
+				desc: 'Saved in the Obsidian keychain. Generate one with /api generate in Discord DMs with the MultiMuse bot, or pick a secret you already saved. Your user ID is detected from the key.',
+				aliases: ['token', 'keychain', 'secret', 'password'],
 				render: (setting: Setting) => {
-					setting.addText(text => {
-						text.setPlaceholder('mm_...')
-							.setValue(this.plugin.settings.apiKey || '');
-						text.inputEl.setAttr('type', 'password');
-						text.onChange(value => void this.setApiKey(value));
-					});
+					this.mountApiKeySetting(setting);
 				},
 			},
 			{
@@ -3782,15 +3840,9 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.obsidianSourceOfTruth)
 				.onChange(value => void this.setSourceOfTruth(value)));
 
-		new Setting(containerEl)
+		this.mountApiKeySetting(new Setting(containerEl)
 			.setName('API key')
-			.setDesc('Generate one with /api generate in Discord DMs with the MultiMuse bot. Your user ID is detected from the key.')
-			.addText(text => {
-				text.setPlaceholder('mm_...')
-					.setValue(this.plugin.settings.apiKey || '');
-				text.inputEl.setAttr('type', 'password');
-				text.onChange(value => void this.setApiKey(value));
-			});
+			.setDesc('Saved in the Obsidian keychain. Generate one with /api generate in Discord DMs with the MultiMuse bot, or pick a secret you already saved. Your user ID is detected from the key.'));
 
 		if (this.plugin.settings.cachedUserId) {
 			new Setting(containerEl)
@@ -3888,7 +3940,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 	}
 
 	private async refreshServerFolderList(): Promise<void> {
-		if (!this.plugin.settings.apiKey) {
+		if (!this.plugin.getApiKey()) {
 			new Notice('API key must be configured in settings.');
 			return;
 		}
@@ -3987,12 +4039,40 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		await this.plugin.saveSettings();
 	}
 
-	private async setApiKey(value: string): Promise<void> {
-		this.plugin.settings.apiKey = value.trim();
-		this.plugin.settings.cachedUserId = '';
+	private mountApiKeySetting(setting: Setting): void {
+		if (typeof SecretComponent === 'function' && this.app.secretStorage) {
+			setting.addComponent((el) => {
+				const field = new SecretComponent(this.app, el);
+				const current = this.plugin.settings.apiKey || '';
+				if (current) field.setValue(current);
+				field.onChange((value) => {
+					void this.applyApiKeySecret(value ?? '', true);
+				});
+				return field;
+			});
+			return;
+		}
+		setting.addText(text => {
+			text.setPlaceholder('mm_...')
+				.setValue(this.plugin.settings.apiKey || '');
+			text.inputEl.setAttr('type', 'password');
+			text.onChange(value => void this.applyApiKeySecret(value, false));
+		});
+	}
+
+	private async applyApiKeySecret(secretId: string, refresh: boolean): Promise<void> {
+		const nextId = (secretId || '').trim();
+		if (nextId === (this.plugin.settings.apiKey || '').trim()) return;
+		const previousToken = this.plugin.getApiKey();
+		this.plugin.settings.apiKey = nextId;
+		const nextToken = this.plugin.getApiKey();
+		if (nextToken !== previousToken) {
+			this.plugin.settings.cachedUserId = '';
+		}
 		await this.plugin.saveSettings();
-		if (!value.trim()) {
+		if (!nextToken) {
 			this.plugin.syncTrackerLiveConnection();
+			if (refresh) this.refreshSettingsView();
 			return;
 		}
 		const userId = await this.plugin.getUserIdFromApiKey();
@@ -4007,6 +4087,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		} else {
 			new Notice('Failed to get user ID from API key. Please check your API key.');
 		}
+		if (refresh) this.refreshSettingsView();
 	}
 }
 
