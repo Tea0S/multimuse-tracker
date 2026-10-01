@@ -2836,7 +2836,10 @@ export default class MultimuseObsidian extends Plugin {
 		});
 		if (!draft) return;
 
-		const selectedMuse = draft.muse;
+		const selectedMuses = draft.muses;
+		const characterNames = selectedMuses
+			.map((muse) => muse.name.trim())
+			.filter((name) => name.length > 0);
 		const threadUrl = draft.threadUrl;
 		const threadInfo = this.extractThreadInfoFromUrl(threadUrl);
 		if (!threadInfo) {
@@ -2846,12 +2849,16 @@ export default class MultimuseObsidian extends Plugin {
 		const location = draft.location;
 		const sceneName = draft.sceneName;
 		const participants = draft.participants;
+		if (!characterNames.length) {
+			new Notice('Choose at least one character.');
+			return;
+		}
 
 		// 7) Create scene file
 		const filePath = `${location}/${sceneName}.md`;
 		const frontmatter: Record<string, FrontmatterValue> = {
 			'Link': threadUrl,
-			'Characters': [selectedMuse.name],
+			'Characters': characterNames,
 			'Participants': participants,
 			'Replied?': false,
 			'Created': new Date().toISOString().split('T')[0],
@@ -2908,7 +2915,7 @@ export default class MultimuseObsidian extends Plugin {
 				threadId: threadInfo.threadId,
 				userId: primaryUserId,
 				scenePath: createdFile.path,
-				characters: [selectedMuse.name],
+				characters: characterNames,
 				participants: participants,
 				guildId: threadInfo.guildId || null,
 				isActive: true,
@@ -2917,7 +2924,7 @@ export default class MultimuseObsidian extends Plugin {
 			if (registerResponse.status === 200) {
 				this.sceneMetadataSyncCache.set(
 					createdFile.path,
-					metadataFingerprint([selectedMuse.name], participants)
+					metadataFingerprint(characterNames, participants)
 				);
 				// Add to Base if configured
 				try {

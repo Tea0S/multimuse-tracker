@@ -3,7 +3,7 @@ import { App, Modal, normalizePath } from 'obsidian';
 const NEW_CHOICE = '__new__';
 
 export interface CreateSceneDraft<T> {
-	muse: T;
+	muses: T[];
 	threadUrl: string;
 	location: string;
 	sceneName: string;
@@ -43,7 +43,8 @@ class CreateSceneModal<T> extends Modal {
 	private newFolder = '';
 	private folderQuery = '';
 	private museQuery = '';
-	private selectedMuse = 0;
+	/** Click order. The first entry is the primary character for the scene name and character folder. */
+	private selectedMuseOrder: number[] = [];
 	private lastAutoGuild = '';
 	private extraRoleplays: string[] = [];
 	private nameInput!: HTMLInputElement;
@@ -54,6 +55,7 @@ class CreateSceneModal<T> extends Modal {
 	private folderSearchHost!: HTMLElement;
 	private folderExtraHost!: HTMLElement;
 	private museHost!: HTMLElement;
+	private museSummary!: HTMLElement;
 	private submitBtn!: HTMLButtonElement;
 
 	constructor(opts: CreateSceneModalOptions<T>, finish: (draft: CreateSceneDraft<T> | null) => void) {
@@ -61,7 +63,6 @@ class CreateSceneModal<T> extends Modal {
 		this.opts = opts;
 		this.finish = finish;
 		this.selectedRoleplay = opts.roleplays[0] || NEW_CHOICE;
-		this.selectedMuse = opts.muses.length ? 0 : -1;
 	}
 
 	onOpen(): void {
@@ -100,7 +101,8 @@ class CreateSceneModal<T> extends Modal {
 		this.folderHost = contentEl.createDiv({ cls: 'mm-create__grid' });
 		this.folderExtraHost = contentEl.createDiv();
 
-		contentEl.createDiv({ cls: 'mm-create__heading', text: 'Muse' });
+		contentEl.createDiv({ cls: 'mm-create__heading', text: 'Characters' });
+		this.museSummary = contentEl.createDiv({ cls: 'mm-create__sub' });
 		if (this.opts.muses.length > 6) {
 			const search = this.addField(contentEl, 'Search', 'muse-search', 'text');
 			search.placeholder = 'Filter muses';
@@ -280,26 +282,41 @@ class CreateSceneModal<T> extends Modal {
 	}
 
 	private renderMuses(): void {
+		const selectedCount = this.selectedMuseOrder.length;
+		this.museSummary.setText(selectedCount === 0
+			? 'Select each character. Tap a name again to remove it.'
+			: selectedCount === 1
+				? '1 character selected. Tap another to add them.'
+				: `${selectedCount} characters selected. Tap a name again to remove it.`);
 		this.museHost.empty();
 		const query = this.museQuery.trim().toLowerCase();
-		const rows = this.opts.muses
-			.map((muse, index) => ({ muse, index }))
-			.filter((row) => !query || row.muse.label.toLowerCase().includes(query));
-		if (!rows.length) {
+		const selected = new Set(this.selectedMuseOrder);
+		const rows = this.opts.muses.map((muse, index) => ({ muse, index }));
+		const pinned = rows.filter((row) => selected.has(row.index));
+		const rest = rows.filter((row) => !selected.has(row.index) && (!query || row.muse.label.toLowerCase().includes(query)));
+		if (!pinned.length && !rest.length) {
 			this.museHost.createDiv({ cls: 'mm-create__hint', text: 'No muses match.' });
 			return;
 		}
-		const host = rows.length <= 6 && !query
+		const visible = [...pinned, ...rest.slice(0, 40)];
+		const host = this.opts.muses.length <= 6 && !query
 			? this.museHost.createDiv({ cls: 'mm-create__grid' })
 			: this.museHost.createDiv({ cls: 'mm-create__list' });
-		for (const row of rows.slice(0, query ? 30 : 40)) {
-			this.choiceCard(host, row.muse.label, '', this.selectedMuse === row.index, () => {
-				this.selectedMuse = row.index;
-				this.renderMuses();
-				this.renderFolders();
-				this.refreshSubmit();
+		for (const row of visible) {
+			this.choiceCard(host, row.muse.label, '', selected.has(row.index), () => {
+				this.toggleMuse(row.index);
 			});
 		}
+	}
+
+	private toggleMuse(index: number): void {
+		const before = this.primaryMuseName();
+		const at = this.selectedMuseOrder.indexOf(index);
+		if (at >= 0) this.selectedMuseOrder.splice(at, 1);
+		else this.selectedMuseOrder.push(index);
+		this.renderMuses();
+		if (this.primaryMuseName() !== before) this.renderFolders();
+		this.refreshSubmit();
 	}
 
 	private choiceCard(parent: HTMLElement, title: string, desc: string, selected: boolean, onClick: () => void): void {
@@ -328,25 +345,35 @@ class CreateSceneModal<T> extends Modal {
 		return `${this.opts.scenesFolder}/${rel}`;
 	}
 
+	private chosenMuses(): T[] {
+		return this.selectedMuseOrder
+			.map((index) => this.opts.muses[index]?.value)
+			.filter((muse): muse is T => muse != null);
+	}
+
 	private chosenMuse(): T | null {
-		return this.opts.muses[this.selectedMuse]?.value ?? null;
+		return this.chosenMuses()[0] ?? null;
+	}
+
+	private primaryMuseName(): string {
+		const muse = this.chosenMuse() as { name?: string } | null;
+		return muse && typeof muse.name === 'string' ? muse.name.trim() : '';
 	}
 
 	private resolvedSceneName(): string {
 		const typed = this.sceneName.trim();
 		if (typed) return typed.replace(/[\\/]/g, ' ').replace(/\s+/g, ' ').trim();
-		const muse = this.chosenMuse() as { name?: string } | null;
-		const name = muse && typeof muse.name === 'string' ? muse.name.trim() : '';
+		const name = this.primaryMuseName();
 		return name ? `${name} - Scene` : '';
 	}
 
 	private validationError(): string | null {
+		if (!this.chosenMuses().length) return 'Choose at least one character.';
 		if (!this.resolvedSceneName()) return 'Enter a scene name.';
 		const url = this.threadUrl.trim();
 		if (!url) return 'Paste a Discord thread link.';
 		if (!this.opts.parseThreadUrl(url)) return 'That link is not a Discord channel URL.';
 		if (!this.locationPath()) return 'Choose a roleplay folder.';
-		if (!this.chosenMuse()) return 'Choose a muse.';
 		const count = Number.parseInt(this.participants, 10);
 		if (!Number.isFinite(count) || count < 1) return 'Participants must be at least 1.';
 		return null;
@@ -365,13 +392,13 @@ class CreateSceneModal<T> extends Modal {
 			this.refreshSubmit();
 			return;
 		}
-		const muse = this.chosenMuse();
+		const muses = this.chosenMuses();
 		const location = this.locationPath();
-		if (!muse || !location) return;
+		if (!muses.length || !location) return;
 		const count = Number.parseInt(this.participants, 10);
 		this.settled = true;
 		this.finish({
-			muse,
+			muses,
 			threadUrl: this.threadUrl.trim(),
 			location,
 			sceneName: this.resolvedSceneName(),
