@@ -1,4 +1,5 @@
-import { Plugin, PluginSettingTab, SecretComponent, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope, type SettingDefinitionItem } from 'obsidian';
+import { Plugin, PluginSettingTab, SecretComponent, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope, normalizePath, type SettingDefinitionItem } from 'obsidian';
+import { openCreateSceneModal } from './sceneCreateModal';
 
 interface MultimuseObsidianSettings {
 	botApiUrl: string; // Bot HTTP API URL (hidden from user UI for security)
@@ -23,8 +24,28 @@ interface MultimuseObsidianSettings {
 	trackerSeenThreadIds: string[];
 	/** Discord guild id -> folder under scenesFolder (e.g. "The Scarlet Compact"). */
 	guildFolderMap: Record<string, string>;
+	/** Discord guild id -> how new and imported scenes are nested under that folder. */
+	guildFolderLayout: Record<string, SceneFolderLayout>;
 	/** Discord guild id -> last known server name (settings UI). */
 	guildNameCache: Record<string, string>;
+}
+
+type SceneFolderLayout = 'flat' | 'month' | 'character' | 'month-character' | 'character-month';
+
+const SCENE_FOLDER_LAYOUT_OPTIONS: Record<SceneFolderLayout, string> = {
+	flat: 'In the server folder',
+	month: 'By month (2026-10)',
+	character: 'By character',
+	'month-character': 'Month, then character',
+	'character-month': 'Character, then month',
+};
+
+function isSceneFolderLayout(value: string): value is SceneFolderLayout {
+	return Object.keys(SCENE_FOLDER_LAYOUT_OPTIONS).includes(value);
+}
+
+function vaultPath(value: string): string {
+	return normalizePath(value.trim());
 }
 
 /** Canonical API base URL (no trailing slash). Old IP:port configs are migrated to this on load. */
@@ -47,6 +68,7 @@ const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
 	trackerImportSeeded: false,
 	trackerSeenThreadIds: [],
 	guildFolderMap: {},
+	guildFolderLayout: {},
 	guildNameCache: {},
 };
 
@@ -351,6 +373,17 @@ function isVaultScenePath(path: unknown): path is string {
 	return !/^(https?:\/\/|discord:\/\/)/i.test(trimmed);
 }
 
+function characterFolderName(name: string): string {
+	const trimmed = name.trim();
+	if (!trimmed || trimmed.toLowerCase() === 'unknown') return '';
+	const cleaned = trimmed
+		.replace(/[\\/:*?"<>|#[\]]/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.slice(0, 80);
+	return cleaned;
+}
+
 function sanitizeNoteTitle(name: string): string {
 	const cleaned = name
 		.replace(/[\\/:*?"<>|#[\]]/g, ' ')
@@ -448,7 +481,7 @@ export default class MultimuseObsidian extends Plugin {
 		// Add command to manually check now
 		this.addCommand({
 			id: 'check-discord-threads',
-			name: 'Check Discord Threads Now',
+			name: 'Check Discord threads now',
 			callback: () => {
 				void this.checkAllThreads({ force: true });
 			}
@@ -457,7 +490,7 @@ export default class MultimuseObsidian extends Plugin {
 		// Add command to toggle polling
 		this.addCommand({
 			id: 'toggle-polling',
-			name: 'Toggle Discord Polling',
+			name: 'Toggle Discord polling',
 			callback: () => {
 				this.settings.enabled = !this.settings.enabled;
 				void this.saveSettings();
@@ -473,7 +506,7 @@ export default class MultimuseObsidian extends Plugin {
 		// Add command to create new scene (icon for mobile toolbar; ribbon on desktop)
 		this.addCommand({
 			id: 'create-scene',
-			name: 'Create New Scene',
+			name: 'Create new scene',
 			icon: 'file-plus',
 			callback: () => {
 				void this.createNewScene();
@@ -490,7 +523,7 @@ export default class MultimuseObsidian extends Plugin {
 		});
 
 		if (!Platform.isMobile) {
-			this.addRibbonIcon('file-plus', 'Create New Scene', () => {
+			this.addRibbonIcon('file-plus', 'Create new scene', () => {
 				void this.createNewScene();
 			});
 		}
@@ -512,7 +545,7 @@ export default class MultimuseObsidian extends Plugin {
 			editorCallback: (editor, ctx) => {
 				const file = this.resolveEditorFile(ctx);
 				if (!file) {
-					new Notice('Open a scene note (with Link in frontmatter) and try again.');
+					new Notice('Open a scene note (with link in frontmatter) and try again.');
 					return;
 				}
 				void this.insertMentionAtCursor(editor, file);
@@ -521,13 +554,13 @@ export default class MultimuseObsidian extends Plugin {
 
 		this.addCommand({
 			id: 'send-as-muse',
-			name: 'Send as Muse',
+			name: 'Send as muse',
 			icon: 'message-square',
 			editorCallback: (editor, ctx) => {
 				this.rememberEditorSelection(editor);
 				const file = this.resolveEditorFile(ctx);
 				if (!file) {
-					new Notice('Open a scene note (with Link in frontmatter) and try again.');
+					new Notice('Open a scene note (with link in frontmatter) and try again.');
 					return;
 				}
 				void this.sendSelectionAsMuse(editor, file);
@@ -567,19 +600,19 @@ export default class MultimuseObsidian extends Plugin {
 						.onClick(async () => {
 							const file = this.resolveEditorFile(view);
 							if (!file) {
-								new Notice('Open a scene note (with Link in frontmatter) and try again.');
+								new Notice('Open a scene note (with link in frontmatter) and try again.');
 								return;
 							}
 							await this.insertMentionAtCursor(editor, file);
 						});
 				});
 				menu.addItem((item) => {
-					item.setTitle('Send as Muse')
+					item.setTitle('Send as muse')
 						.setIcon('message-square')
 						.onClick(async () => {
 							const file = this.resolveEditorFile(view);
 							if (!file) {
-								new Notice('Open a scene note (with Link in frontmatter) and try again.');
+								new Notice('Open a scene note (with link in frontmatter) and try again.');
 								return;
 							}
 							await this.sendSelectionAsMuse(editor, file);
@@ -607,6 +640,15 @@ export default class MultimuseObsidian extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
 		if (!this.settings.guildFolderMap || typeof this.settings.guildFolderMap !== 'object') {
 			this.settings.guildFolderMap = {};
+		}
+		if (!this.settings.guildFolderLayout || typeof this.settings.guildFolderLayout !== 'object') {
+			this.settings.guildFolderLayout = {};
+		}
+		for (const guildId of Object.keys(this.settings.guildFolderLayout)) {
+			const layout = this.settings.guildFolderLayout[guildId];
+			if (!isSceneFolderLayout(layout)) {
+				delete this.settings.guildFolderLayout[guildId];
+			}
 		}
 		if (!this.settings.guildNameCache || typeof this.settings.guildNameCache !== 'object') {
 			this.settings.guildNameCache = {};
@@ -2139,6 +2181,44 @@ export default class MultimuseObsidian extends Plugin {
 		}, 60000);
 	}
 
+	sceneRoleplayNames(): string[] {
+		const names = new Set(this.getTopLevelSceneFolderNames());
+		for (const folder of Object.values(this.settings.guildFolderMap || {})) {
+			const top = String(folder || '').split('/').map((part) => part.trim()).filter(Boolean)[0];
+			if (top) names.add(top);
+		}
+		return Array.from(names).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+	}
+
+	listSceneSubfolders(roleplay: string): string[] {
+		const root = this.app.vault.getAbstractFileByPath(`${this.settings.scenesFolder}/${roleplay}`);
+		if (!(root instanceof TFolder)) return [];
+		const out: string[] = [];
+		const walk = (folder: TFolder, prefix: string) => {
+			for (const child of folder.children) {
+				if (!(child instanceof TFolder)) continue;
+				const rel = prefix ? `${prefix}/${child.name}` : child.name;
+				out.push(rel);
+				walk(child, rel);
+			}
+		};
+		walk(root, '');
+		return out.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+	}
+
+	roleplayForGuild(guildId: string): { roleplay: string; subfolder: string } | null {
+		const mapped = vaultPath(this.settings.guildFolderMap[guildId] || '');
+		if (mapped) {
+			const parts = mapped.split('/').filter(Boolean);
+			if (!parts.length) return null;
+			return { roleplay: parts[0], subfolder: parts.slice(1).join('/') };
+		}
+		const name = (this.settings.guildNameCache[guildId] || '').trim();
+		const hit = name ? this.matchExistingServerFolder(name) : null;
+		if (!hit) return null;
+		return { roleplay: hit, subfolder: '' };
+	}
+
 	getTopLevelSceneFolderNames(): string[] {
 		const root = this.app.vault.getAbstractFileByPath(this.settings.scenesFolder);
 		if (!(root instanceof TFolder)) {
@@ -2175,10 +2255,60 @@ export default class MultimuseObsidian extends Plugin {
 		return null;
 	}
 
+	folderLayoutForGuild(guildId: string): SceneFolderLayout {
+		const layout = this.settings.guildFolderLayout?.[guildId];
+		return layout && isSceneFolderLayout(layout) ? layout : 'flat';
+	}
+
+	layoutForRoleplay(roleplay: string): SceneFolderLayout {
+		const want = roleplay.trim().toLowerCase();
+		if (!want) return 'flat';
+		for (const [guildId, folder] of Object.entries(this.settings.guildFolderMap || {})) {
+			const top = String(folder || '').split('/').map((part) => part.trim()).filter(Boolean)[0] || '';
+			if (top.toLowerCase() === want) {
+				return this.folderLayoutForGuild(guildId);
+			}
+		}
+		return 'flat';
+	}
+
+	/** Relative folders under the server folder for this layout. Empty means the server folder itself. */
+	organizationSegments(layout: SceneFolderLayout, characterName: string, when: Date = new Date()): string[] {
+		if (layout === 'flat') return [];
+		const month = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}`;
+		const character = characterFolderName(characterName);
+		if (layout === 'month') return [month];
+		if (layout === 'character') return character ? [character] : [];
+		if (layout === 'month-character') return character ? [month, character] : [month];
+		if (layout === 'character-month') return character ? [character, month] : [month];
+		return [];
+	}
+
+	layoutFolderForRoleplay(roleplay: string, characterName: string): string {
+		return this.organizationSegments(this.layoutForRoleplay(roleplay), characterName).join('/');
+	}
+
+	importFolderForThread(guildId: string, guildName: string | null | undefined, characterName: string): string {
+		const root = this.resolveServerFolder(guildId, guildName);
+		const segments = this.organizationSegments(this.folderLayoutForGuild(guildId), characterName);
+		if (!segments.length) return root;
+		return `${root}/${segments.join('/')}`;
+	}
+
+	primaryTrackedCharacter(thread: TrackedThread): string {
+		const single = (thread.muse_name || '').trim();
+		if (single && single.toLowerCase() !== 'unknown') return single;
+		for (const name of thread.muse_names || []) {
+			const trimmed = String(name || '').trim();
+			if (trimmed && trimmed.toLowerCase() !== 'unknown') return trimmed;
+		}
+		return '';
+	}
+
 	resolveServerFolder(guildId: string, guildName?: string | null): string {
-		const mapped = (this.settings.guildFolderMap[guildId] || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+		const mapped = vaultPath(this.settings.guildFolderMap[guildId] || '');
 		if (mapped) {
-			return `${this.settings.scenesFolder}/${mapped}`;
+			return vaultPath(`${this.settings.scenesFolder}/${mapped}`);
 		}
 
 		const name = (guildName || this.settings.guildNameCache[guildId] || '').trim();
@@ -2186,7 +2316,7 @@ export default class MultimuseObsidian extends Plugin {
 		const folderName = matched
 			|| sanitizeNoteTitle(name.split('|')[0] || name || `Server ${guildId.slice(-4)}`);
 		this.settings.guildFolderMap[guildId] = folderName;
-		return `${this.settings.scenesFolder}/${folderName}`;
+		return vaultPath(`${this.settings.scenesFolder}/${folderName}`);
 	}
 
 	async uniqueSceneFilePath(folderPath: string, title: string): Promise<string> {
@@ -2436,7 +2566,11 @@ export default class MultimuseObsidian extends Plugin {
 					continue;
 				}
 
-				const folderPath = this.resolveServerFolder(guildId, thread.guild_name);
+				const folderPath = this.importFolderForThread(
+					guildId,
+					thread.guild_name,
+					this.primaryTrackedCharacter(thread)
+				);
 				settingsDirty = true;
 				await this.ensureFolderPathExists(folderPath);
 
@@ -2688,33 +2822,30 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		muses = sortMusesAlphabetically(muses);
+		const labels = displayLabelsForMuses(muses);
+		const draft = await openCreateSceneModal({
+			app: this.app,
+			scenesFolder: this.settings.scenesFolder,
+			muses: muses.map((muse, index) => ({ value: muse, label: labels[index] || muse.name })),
+			roleplays: this.sceneRoleplayNames(),
+			listSubfolders: (roleplay) => this.listSceneSubfolders(roleplay),
+			roleplayForGuild: (guildId) => this.roleplayForGuild(guildId),
+			layoutFolder: (roleplay, muse) => this.layoutFolderForRoleplay(roleplay, muse?.name || ''),
+			parseThreadUrl: (url) => this.extractThreadInfoFromUrl(url),
+			trapKeys: (modal, onEnter) => this.isolateWizardModal(modal, onEnter),
+		});
+		if (!draft) return;
 
-		// 2) Select muse — duplicate names use the same (tags) labels as Discord
-		const selectedMuse = await this.suggestMuse(muses, 'Select a muse');
-		if (!selectedMuse) return;
-		const selectedLabel = museLabelInList(muses, selectedMuse, selectedMuse.name);
-
-		// 3) Get Discord thread/channel link
-		const threadUrl = await this.showInputPrompt('Enter Discord thread/channel URL');
-		if (!threadUrl) return;
-
+		const selectedMuse = draft.muse;
+		const threadUrl = draft.threadUrl;
 		const threadInfo = this.extractThreadInfoFromUrl(threadUrl);
 		if (!threadInfo) {
 			new Notice('Invalid Discord URL format.');
 			return;
 		}
-
-		// 4) Get location (RP folder) - pass muse name for context
-		const location = await this.selectSceneLocation(`muse "${selectedLabel}"`);
-		if (!location) return;
-
-		// 5) Get scene name
-		const sceneName = await this.showInputPrompt('Enter scene name', `${selectedMuse.name} - Scene`);
-		if (!sceneName) return;
-
-		// 6) Get participants
-		const participantsStr = await this.showInputPrompt('Number of participants (default: 2)', '2');
-		const participants = parseInt(participantsStr) || 2;
+		const location = draft.location;
+		const sceneName = draft.sceneName;
+		const participants = draft.participants;
 
 		// 7) Create scene file
 		const filePath = `${location}/${sceneName}.md`;
@@ -2815,7 +2946,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	/** Ensure each segment of `folderPath` exists under the vault root. */
 	async ensureFolderPathExists(folderPath: string): Promise<void> {
-		const normalized = folderPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+		const normalized = vaultPath(folderPath);
 		if (!normalized) return;
 		const parts = normalized.split('/').filter((p) => p.length > 0);
 		let acc = '';
@@ -2910,19 +3041,13 @@ export default class MultimuseObsidian extends Plugin {
 	 * If **Obsidian Base Path** is empty, creates `<Scenes Folder>/Roleplay Tracker.base` and saves that path.
 	 */
 	async initializeMultimuseWorkspace(): Promise<void> {
-		const scenesFolder = this.settings.scenesFolder
-			.trim()
-			.replace(/\\/g, '/')
-			.replace(/^\/+|\/+$/g, '');
+		const scenesFolder = vaultPath(this.settings.scenesFolder);
 		if (!scenesFolder) {
-			new Notice('Set Scenes Folder in Multimuse Tracker settings first.');
+			new Notice('Set scenes folder in MultiMuse tracker settings first.');
 			return;
 		}
 
-		const configuredBase = this.settings.basePath
-			.trim()
-			.replace(/\\/g, '/')
-			.replace(/^\/+|\/+$/g, '');
+		const configuredBase = vaultPath(this.settings.basePath);
 
 		let targetBasePath: string;
 		if (!configuredBase) {
@@ -2933,7 +3058,7 @@ export default class MultimuseObsidian extends Plugin {
 
 		const ext = (targetBasePath.split('.').pop() || '').toLowerCase();
 		if (ext !== 'base' && ext !== 'md') {
-			new Notice('Obsidian Base Path must end in .base or .md, or leave it empty to create Roleplay Tracker.base under your scenes folder.');
+			new Notice('Obsidian base path must end in .base or .md, or leave it empty to create Roleplay Tracker.base under your scenes folder.');
 			return;
 		}
 
@@ -2942,7 +3067,7 @@ export default class MultimuseObsidian extends Plugin {
 
 			const existing = this.app.vault.getAbstractFileByPath(targetBasePath);
 			if (existing) {
-				new Notice(`Already exists: ${targetBasePath}. Remove it or change Obsidian Base Path in settings, then run again.`);
+				new Notice(`Already exists: ${targetBasePath}. Remove it or change Obsidian base path in settings, then run again.`);
 				return;
 			}
 
@@ -2994,32 +3119,22 @@ export default class MultimuseObsidian extends Plugin {
 			}
 
 			// Read Base file
-			const baseContent = await this.app.vault.read(baseFile);
-			
-			// Extract characters from frontmatter
 			const characters = this.getCharacterNames(frontmatter);
 			const link = frontmatterValueToString(frontmatter['Link']);
 			const participants = frontmatterValueToString(frontmatter['Participants'], '2');
 			const replied = frontmatterValueToString(frontmatter['Replied?'], 'false');
-
-			// Check if scene already exists in table
-			if (baseContent.includes(`| ${file.basename} |`)) {
-				// Scene already exists, skip
-				return;
-			}
-
-			// Add record as markdown table row
 			const recordLine = `| ${file.basename} | ${characters.join(', ')} | ${link} | ${participants} | ${replied} |\n`;
-			
-			// Check if Base has table structure
-			if (baseContent.includes('|')) {
-				// Append to existing table
-				await this.app.vault.modify(baseFile, baseContent + recordLine);
-			} else {
-				// Create table structure
-				const tableHeader = '| Scene | Characters | Link | Participants | Replied? |\n|-------|------------|------|--------------|----------|\n';
-				await this.app.vault.modify(baseFile, tableHeader + recordLine);
-			}
+			const tableHeader = '| Scene | Characters | Link | Participants | Replied? |\n|-------|------------|------|--------------|----------|\n';
+
+			await this.app.vault.process(baseFile, (baseContent) => {
+				if (baseContent.includes(`| ${file.basename} |`)) {
+					return baseContent;
+				}
+				if (baseContent.includes('|')) {
+					return baseContent + recordLine;
+				}
+				return tableHeader + recordLine;
+			});
 		} catch {
 			/* markdown tracker table update is optional */
 		}
@@ -3114,7 +3229,7 @@ export default class MultimuseObsidian extends Plugin {
 				: `Folder under "${RP_ROOT}" (e.g. For the Greeks/Twin Flames)`;
 			const input = await this.showInputPrompt(promptMsg);
 			if (!input) return null;
-			relPath = input.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+			relPath = vaultPath(input);
 		} else {
 			relPath = choice;
 		}
@@ -3329,12 +3444,12 @@ export default class MultimuseObsidian extends Plugin {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const frontmatter = this.getFrontmatter(cache);
 		if (!frontmatter) {
-			new Notice('No frontmatter. Add a Link property (Discord thread URL) to this note.');
+			new Notice('No frontmatter. Add a link property (Discord thread URL) to this note.');
 			return;
 		}
 		const link = frontmatter['Link'];
 		if (typeof link !== 'string') {
-			new Notice('No Link property. Add the Discord thread URL to frontmatter to use @ mentions.');
+			new Notice('No link property. Add the Discord thread URL to frontmatter to use @ mentions.');
 			return;
 		}
 		const threadInfo = this.extractThreadInfoFromUrl(link);
@@ -3367,7 +3482,7 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 		if (members.length === 0) {
-			new Notice('No members returned for this server. Bot may need Server Members intent.');
+			new Notice('No members returned for this server. Bot may need server members intent.');
 			return;
 		}
 		const sortedMembers = [...members].sort((a, b) => {
@@ -3404,27 +3519,27 @@ export default class MultimuseObsidian extends Plugin {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const frontmatter = this.getFrontmatter(cache);
 		if (!frontmatter) {
-			new Notice('File does not have frontmatter. Please add Link and Characters properties.');
+			new Notice('File does not have frontmatter. Please add link and characters properties.');
 			return;
 		}
 
 		// Extract link and characters
 		const link = frontmatter?.['Link'];
 		if (typeof link !== 'string') {
-			new Notice('No Link property found in frontmatter. Please add a Discord thread URL.');
+			new Notice('No link property found in frontmatter. Please add a Discord thread URL.');
 			return;
 		}
 
 		const characters = this.getSortedCharacterNames(frontmatter);
 		if (characters.length === 0) {
-			new Notice('No Characters property found in frontmatter. Please add at least one character name.');
+			new Notice('No characters property found in frontmatter. Please add at least one character name.');
 			return;
 		}
 
 		// Extract thread ID from link
 		const threadId = this.extractThreadIdFromUrl(link);
 		if (!threadId) {
-			new Notice('Invalid Discord URL format in Link property.');
+			new Notice('Invalid Discord URL format in link property.');
 			return;
 		}
 
@@ -3575,7 +3690,6 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	/** 1.13.0+: Obsidian renders this and skips display(). Also indexes settings search. */
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		return [
 			{
@@ -3593,7 +3707,6 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				render: (setting: Setting) => {
 					setting.addSlider(slider => slider
 						.setLimits(5, 60, 5)
-						.setDynamicTooltip()
 						.setValue(this.plugin.settings.pollInterval)
 						.onChange(value => void this.setPollInterval(value)));
 				},
@@ -3604,8 +3717,8 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				control: { type: 'text', key: 'scenesFolder', placeholder: 'RP Scenes' },
 			},
 			{
-				name: 'Obsidian Base path',
-				desc: 'Path to your Obsidian Base file (for example RP Scenes/Roleplay Tracker.base). Leave empty and use Initialize workspace to create one.',
+				name: 'Obsidian base path',
+				desc: 'Path to your Obsidian base file (for example RP Scenes/Roleplay Tracker.base). Leave empty and use Initialize workspace to create one.',
 				control: { type: 'text', key: 'basePath', placeholder: 'RP Scenes/Roleplay Tracker.base' },
 			},
 			{
@@ -3654,12 +3767,12 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				heading: 'Scene properties',
 				items: [
 					{
-						name: 'Track Roleplay property',
+						name: 'Track roleplay property',
 						desc: 'Add a Roleplay property to new scene files from the selected folder name.',
 						control: { type: 'toggle', key: 'trackRoleplay' },
 					},
 					{
-						name: 'Track Is Active? property',
+						name: 'Track is active? property',
 						desc: 'Add an Is Active? property to new scene files (defaults to true).',
 						control: { type: 'toggle', key: 'trackIsActive' },
 					},
@@ -3725,164 +3838,6 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		];
 	}
 
-	display(): void {
-		const { containerEl } = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Enable polling')
-			.setDesc('Automatically check Discord threads for new replies')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.enabled)
-				.onChange(value => void this.setPollingEnabled(value)));
-
-		new Setting(containerEl)
-			.setName('Poll interval (minutes)')
-			.setDesc('How often to check for new replies')
-			.addSlider(slider => slider
-				.setLimits(5, 60, 5)
-				.setDynamicTooltip()
-				.setValue(this.plugin.settings.pollInterval)
-				.onChange(value => void this.setPollInterval(value)));
-
-		new Setting(containerEl)
-			.setName('Scenes folder')
-			.setDesc('Folder containing your scene files')
-			.addText(text => text
-				.setPlaceholder('RP Scenes')
-				.setValue(this.plugin.settings.scenesFolder)
-				.onChange(async (value) => {
-					this.plugin.settings.scenesFolder = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Obsidian Base path')
-			.setDesc('Path to your Obsidian Base file (for example RP Scenes/Roleplay Tracker.base). Leave empty and use Initialize workspace to create one.')
-			.addText(text => text
-				.setPlaceholder('RP Scenes/Roleplay Tracker.base')
-				.setValue(this.plugin.settings.basePath)
-				.onChange(async (value) => {
-					this.plugin.settings.basePath = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Initialize workspace')
-			.setDesc('Create your scenes folder and tracker base from the paths above.')
-			.addButton(button => button
-				.setButtonText('Initialize')
-				.setCta()
-				.onClick(() => {
-					void this.plugin.initializeMultimuseWorkspace();
-				}));
-
-		new Setting(containerEl)
-			.setName('Import from tracker')
-			.setHeading();
-
-		new Setting(containerEl)
-			.setName('Auto-create notes from tracker')
-			.setDesc('After you turn this on, new /track add and StageHand scene opens get a note immediately. Existing tracker history is not imported. A new scene in a persistent hub still gets a new note.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.autoCreateFromTracker)
-				.onChange(value => void this.plugin.onAutoCreateFromTrackerChanged(value)));
-
-		new Setting(containerEl)
-			.setName('Import unfiled tracked scenes')
-			.setDesc('Create notes for open (unarchived) tracked threads that are not already in the vault. A new StageHand scene in a persistent hub creates a new note even if that thread was imported before.')
-			.addButton(button => button
-				.setButtonText('Import now')
-				.onClick(() => {
-					void this.plugin.importUnfiledTrackedScenesNow();
-				}));
-
-		new Setting(containerEl)
-			.setName('Load servers from tracker')
-			.setDesc('Fill the server list from Discord servers on your tracker.')
-			.addButton(button => button
-				.setButtonText('Load servers')
-				.onClick(() => {
-					void this.refreshServerFolderList();
-				}));
-
-		this.renderServerFolderSettings(containerEl);
-
-		new Setting(containerEl)
-			.setName('Scene properties')
-			.setHeading();
-
-		new Setting(containerEl)
-			.setName('Track Roleplay property')
-			.setDesc('Add a Roleplay property to new scene files from the selected folder name.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.trackRoleplay)
-				.onChange(async (value) => {
-					this.plugin.settings.trackRoleplay = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Track Is Active? property')
-			.setDesc('Add an Is Active? property to new scene files (defaults to true).')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.trackIsActive)
-				.onChange(async (value) => {
-					this.plugin.settings.trackIsActive = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Obsidian as source of truth')
-			.setDesc('Push Characters and Participants edits from scene frontmatter to MultiMuse using the thread id in Link.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.obsidianSourceOfTruth)
-				.onChange(value => void this.setSourceOfTruth(value)));
-
-		this.mountApiKeySetting(new Setting(containerEl)
-			.setName('API key')
-			.setDesc('Saved in the Obsidian keychain. Generate one with /api generate in Discord DMs with the MultiMuse bot, or pick a secret you already saved. Your user ID is detected from the key.'));
-
-		if (this.plugin.settings.cachedUserId) {
-			new Setting(containerEl)
-				.setName('Detected user ID')
-				.setDesc(`Your Discord user ID, detected from the API key: ${this.plugin.settings.cachedUserId}`)
-				.addText(text => {
-					text.setValue(this.plugin.settings.cachedUserId);
-					text.setDisabled(true);
-				});
-		}
-
-		new Setting(containerEl)
-			.setName('Sync muses')
-			.setDesc('Refresh muse names from the MultiMuse API.')
-			.addButton(button => button
-				.setButtonText('Sync now')
-				.setCta()
-				.onClick(async () => {
-					await this.plugin.syncMuses();
-					new Notice('Muses synced!');
-				}));
-
-		new Setting(containerEl)
-			.setName('Manual check')
-			.setDesc('Check Discord threads now.')
-			.addButton(button => button
-				.setButtonText('Check now')
-				.setCta()
-				.onClick(() => {
-					void this.plugin.checkAllThreads({ force: true });
-					new Notice('Checking Discord threads...');
-				}));
-
-		new Setting(containerEl)
-			.setName('How it works')
-			.setHeading();
-		containerEl.createEl('p', { text: 'Scenes need a Link (Discord thread URL) and Characters in frontmatter. Polling updates Replied? — true means you replied, false means it is your turn. Auto-create (off by default) only files new tracks after you turn it on, not your existing tracker history.' });
-		containerEl.createEl('p', { text: 'Generate an API key with /api generate in Discord DMs with the bot.' });
-	}
-
 	private listKnownGuildIds(): string[] {
 		return Array.from(new Set([
 			...Object.keys(this.plugin.settings.guildFolderMap || {}),
@@ -3898,7 +3853,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 	private serverFolderSettingsDesc(): string {
 		const scenesFolder = this.plugin.settings.scenesFolder || 'RP Scenes';
 		return this.listKnownGuildIds().length > 0
-			? `Folder under "${scenesFolder}" for each Discord server. Nested folders (months, partners) stay manual.`
+			? `Folder under "${scenesFolder}" for each Discord server, and how new or imported scenes are nested inside it.`
 			: `Folders appear here after Load servers, a poll, or Import now. Matching existing folders under "${scenesFolder}" is case-insensitive.`;
 	}
 
@@ -3913,30 +3868,14 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				name: label,
 				desc: `Server ${guildId}`,
 				render: (setting: Setting) => {
-					setting.addText(text => text
-						.setPlaceholder('For The Greeks')
-						.setValue(this.plugin.settings.guildFolderMap[guildId] || '')
-						.onChange(async (value) => {
-							const folder = value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-							if (folder) {
-								this.plugin.settings.guildFolderMap[guildId] = folder;
-							} else {
-								delete this.plugin.settings.guildFolderMap[guildId];
-							}
-							await this.plugin.saveSettings();
-						}));
+					this.attachServerFolderControls(setting, guildId);
 				},
 			};
 		});
 	}
 
 	private refreshSettingsView(): void {
-		const tab = this as PluginSettingTab & { update?: () => void };
-		if (typeof tab.update === 'function') {
-			tab.update();
-			return;
-		}
-		this.display();
+		this.update();
 	}
 
 	private async refreshServerFolderList(): Promise<void> {
@@ -3987,31 +3926,33 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private renderServerFolderSettings(containerEl: HTMLElement): void {
-		const guildIds = this.listKnownGuildIds();
-
-		new Setting(containerEl)
-			.setName('Server folders')
-			.setDesc(this.serverFolderSettingsDesc());
-
-		for (const guildId of guildIds) {
-			const label = this.plugin.settings.guildNameCache[guildId] || guildId;
-			new Setting(containerEl)
-				.setName(label)
-				.setDesc(`Server ${guildId}`)
-				.addText(text => text
-					.setPlaceholder('For The Greeks')
-					.setValue(this.plugin.settings.guildFolderMap[guildId] || '')
-					.onChange(async (value) => {
-						const folder = value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-						if (folder) {
-							this.plugin.settings.guildFolderMap[guildId] = folder;
-						} else {
-							delete this.plugin.settings.guildFolderMap[guildId];
-						}
-						await this.plugin.saveSettings();
-					}));
-		}
+	private attachServerFolderControls(setting: Setting, guildId: string): void {
+		setting.addText(text => text
+			.setPlaceholder('Roleplay folder')
+			.setValue(this.plugin.settings.guildFolderMap[guildId] || '')
+			.onChange(async (value) => {
+				const folder = vaultPath(value);
+				if (folder) {
+					this.plugin.settings.guildFolderMap[guildId] = folder;
+				} else {
+					delete this.plugin.settings.guildFolderMap[guildId];
+				}
+				await this.plugin.saveSettings();
+			}));
+		setting.addDropdown(dropdown => {
+			for (const [value, label] of Object.entries(SCENE_FOLDER_LAYOUT_OPTIONS)) {
+				dropdown.addOption(value, label);
+			}
+			dropdown.setValue(this.plugin.folderLayoutForGuild(guildId));
+			dropdown.onChange(async (value) => {
+				if (!isSceneFolderLayout(value) || value === 'flat') {
+					delete this.plugin.settings.guildFolderLayout[guildId];
+				} else {
+					this.plugin.settings.guildFolderLayout[guildId] = value;
+				}
+				await this.plugin.saveSettings();
+			});
+		});
 	}
 
 	private async setPollingEnabled(value: boolean): Promise<void> {
@@ -4053,7 +3994,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 			return;
 		}
 		setting.addText(text => {
-			text.setPlaceholder('mm_...')
+			text.setPlaceholder('Paste your API key')
 				.setValue(this.plugin.settings.apiKey || '');
 			text.inputEl.setAttr('type', 'password');
 			text.onChange(value => void this.applyApiKeySecret(value, false));
