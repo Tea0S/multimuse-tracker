@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, SecretComponent, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope, normalizePath, type SettingDefinitionItem } from 'obsidian';
+import { Plugin, PluginSettingTab, SecretComponent, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, MarkdownFileInfo, CachedMetadata, RequestUrlResponse, Platform, Scope, normalizePath, getFrontMatterInfo, type SettingDefinitionItem } from 'obsidian';
 import { openCreateSceneModal } from './sceneCreateModal';
 
 interface MultimuseObsidianSettings {
@@ -421,6 +421,62 @@ function yamlNeedsQuotes(value: string): boolean {
 		|| value === 'null';
 }
 
+function formatFrontmatterScalar(value: string | number | boolean): string {
+	if (typeof value === 'string') {
+		return yamlNeedsQuotes(value) ? JSON.stringify(value) : value;
+	}
+	return String(value);
+}
+
+function frontmatterBodiesMatch(before: string, after: string): boolean {
+	const beforeInfo = getFrontMatterInfo(before);
+	const afterInfo = getFrontMatterInfo(after);
+	const beforeBody = beforeInfo.exists ? before.slice(beforeInfo.contentStart) : before;
+	const afterBody = afterInfo.exists ? after.slice(afterInfo.contentStart) : after;
+	return beforeBody === afterBody;
+}
+
+/**
+ * Change one scalar frontmatter key and leave the note body byte-for-byte.
+ * Returns null when the splice would eat the body (the failure that wiped open scenes).
+ */
+function setFrontmatterScalar(content: string, key: string, value: string | number | boolean): string | null {
+	const rendered = formatFrontmatterScalar(value);
+	const info = getFrontMatterInfo(content);
+	const newline = content.includes('\r\n') ? '\r\n' : '\n';
+	let next: string;
+	if (!info.exists) {
+		next = `---${newline}${key}: ${rendered}${newline}---${newline}${content}`;
+	} else {
+		const block = content.slice(info.from, info.to);
+		const pattern = new RegExp(`^(["']?)${escapeRegExp(key)}\\1[ \\t]*:[^\\n]*$`, 'm');
+		const nextBlock = pattern.test(block)
+			? block.replace(pattern, `${key}: ${rendered}`)
+			: `${block.replace(/\s+$/, '')}${newline}${key}: ${rendered}${newline}`;
+		if (nextBlock === block) {
+			return content;
+		}
+		next = content.slice(0, info.from) + nextBlock + content.slice(info.to);
+	}
+	if (!frontmatterBodiesMatch(content, next)) {
+		return null;
+	}
+	return next;
+}
+
+function offsetToEditorPos(content: string, offset: number): { line: number; ch: number } {
+	let line = 0;
+	let lineStart = 0;
+	const end = Math.min(offset, content.length);
+	for (let i = 0; i < end; i++) {
+		if (content.charCodeAt(i) === 10) {
+			line++;
+			lineStart = i + 1;
+		}
+	}
+	return { line, ch: end - lineStart };
+}
+
 export default class MultimuseObsidian extends Plugin {
 	settings: MultimuseObsidianSettings;
 	pollIntervalId: number | null = null;
@@ -458,6 +514,8 @@ export default class MultimuseObsidian extends Plugin {
 	private trackerEventsEverReady = false;
 	private trackerEventsFailCount = 0;
 	private pendingLiveCreates = new Map<string, { thread: TrackedThread; timer: number }>();
+	/** Serializes tracker imports so a live event and a poll cannot each create a note. */
+	private importChain: Promise<void> = Promise.resolve();
 
 	async onload() {
 		await this.loadSettings();
@@ -2257,7 +2315,26 @@ export default class MultimuseObsidian extends Plugin {
 
 	folderLayoutForGuild(guildId: string): SceneFolderLayout {
 		const layout = this.settings.guildFolderLayout?.[guildId];
-		return layout && isSceneFolderLayout(layout) ? layout : 'flat';
+		if (layout && isSceneFolderLayout(layout)) {
+			return layout;
+		}
+		// A live payload can carry a guild id that is not the settings key (precision
+		// or a second id for the same server). Use the layout saved for that folder.
+		const folder = (this.settings.guildFolderMap[guildId] || '').split('/')[0].trim().toLowerCase();
+		if (!folder) {
+			return 'flat';
+		}
+		for (const [otherId, otherFolder] of Object.entries(this.settings.guildFolderMap || {})) {
+			const top = String(otherFolder || '').split('/')[0].trim().toLowerCase();
+			if (top !== folder) {
+				continue;
+			}
+			const otherLayout = this.settings.guildFolderLayout?.[otherId];
+			if (otherLayout && isSceneFolderLayout(otherLayout)) {
+				return otherLayout;
+			}
+		}
+		return 'flat';
 	}
 
 	layoutForRoleplay(roleplay: string): SceneFolderLayout {
@@ -2492,6 +2569,16 @@ export default class MultimuseObsidian extends Plugin {
 		userId: string,
 		opts: { mode: 'new' | 'backfill' | 'live' }
 	): Promise<number> {
+		const run = this.importChain.then(() => this.importUnfiledTrackedThreadsNow(trackedThreads, userId, opts));
+		this.importChain = run.then(() => undefined, () => undefined);
+		return run;
+	}
+
+	private async importUnfiledTrackedThreadsNow(
+		trackedThreads: TrackedThread[],
+		userId: string,
+		opts: { mode: 'new' | 'backfill' | 'live' }
+	): Promise<number> {
 		const currentIds = [...new Set(
 			trackedThreads
 				.map((thread) => String(thread.thread_id || '').trim())
@@ -2544,7 +2631,25 @@ export default class MultimuseObsidian extends Plugin {
 					continue;
 				}
 
-				const filesForThread = existingByThread.get(threadId) || [];
+				const registeredFile = [thread.scene_path, ...(thread.scene_paths || [])]
+					.filter(isVaultScenePath)
+					.map((path) => this.app.vault.getAbstractFileByPath(path.trim()))
+					.find((file): file is TFile => file instanceof TFile);
+				// A registered note already covers this thread. A new persistent-hub
+				// title still gets its own note when the registered file is a different scene.
+				if (
+					registeredFile
+					&& (this.noteMatchesSceneTitle(registeredFile, title) || !this.hasDistinctSceneName(thread))
+				) {
+					seen.add(threadId);
+					continue;
+				}
+
+				const filesForThread = await this.notesLinkedToThread(
+					threadId,
+					title,
+					existingByThread.get(threadId) || [],
+				);
 				if (this.threadHasNoteForTitle(filesForThread, title)) {
 					seen.add(threadId);
 					continue;
@@ -2571,6 +2676,17 @@ export default class MultimuseObsidian extends Plugin {
 					thread.guild_name,
 					this.primaryTrackedCharacter(thread)
 				);
+				const desiredPath = `${folderPath}/${title}.md`;
+				const desiredFile = this.app.vault.getAbstractFileByPath(desiredPath);
+				if (desiredFile instanceof TFile) {
+					const desiredLink = await this.readSceneLink(desiredFile);
+					const desiredThread = desiredLink ? this.extractThreadIdFromUrl(desiredLink) : null;
+					// Same thread, or a note that does not have a Link yet: do not mint "Title 2".
+					if (!desiredThread || desiredThread === threadId) {
+						seen.add(threadId);
+						continue;
+					}
+				}
 				settingsDirty = true;
 				await this.ensureFolderPathExists(folderPath);
 
@@ -2732,17 +2848,110 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 
+	private markdownViewsForFile(file: TFile): MarkdownView[] {
+		const views: MarkdownView[] = [];
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			const view = leaf.view;
+			if (view instanceof MarkdownView && view.file?.path === file.path) {
+				views.push(view);
+			}
+		});
+		return views;
+	}
+
+	/**
+	 * Update one frontmatter scalar without replacing the note.
+	 * Open notes are edited in the editor buffer. processFrontMatter reads disk and
+	 * the editor then reloads that disk copy, which drops unsaved writing.
+	 */
 	async updateFrontmatter(file: TFile, key: string, value: FrontmatterValue): Promise<void> {
+		if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+			return;
+		}
+		const scalar = value;
 		try {
-			await this.app.fileManager.processFrontMatter(file, (rawFrontmatter: unknown) => {
-				if (typeof rawFrontmatter !== 'object' || rawFrontmatter === null) {
-					return;
+			const views = this.markdownViewsForFile(file);
+			if (views.length > 0) {
+				for (const view of views) {
+					const current = view.editor.getValue();
+					const next = setFrontmatterScalar(current, key, scalar);
+					if (!next || next === current) {
+						continue;
+					}
+					const currentInfo = getFrontMatterInfo(current);
+					const nextInfo = getFrontMatterInfo(next);
+					const cursor = view.editor.getCursor();
+					const scroll = view.editor.getScrollInfo();
+					view.editor.replaceRange(
+						next.slice(0, nextInfo.contentStart),
+						{ line: 0, ch: 0 },
+						offsetToEditorPos(current, currentInfo.exists ? currentInfo.contentStart : 0),
+					);
+					view.editor.setCursor(cursor);
+					view.editor.scrollTo(scroll.left, scroll.top);
 				}
-				Reflect.set(rawFrontmatter, key, value);
+				return;
+			}
+
+			await this.app.vault.process(file, (current) => {
+				const next = setFrontmatterScalar(current, key, scalar);
+				return next ?? current;
 			});
 		} catch {
 			/* YAML parse errors leave the note unchanged; next poll retries */
 		}
+	}
+
+	private linkFromNoteContent(content: string): string | null {
+		const info = getFrontMatterInfo(content);
+		if (!info.exists) {
+			return null;
+		}
+		const match = content.slice(info.from, info.to).match(/^(["']?)Link\1[ \t]*:[ \t]*(.*)$/m);
+		if (!match) {
+			return null;
+		}
+		let value = match[2].trim();
+		if (
+			(value.startsWith('"') && value.endsWith('"'))
+			|| (value.startsWith("'") && value.endsWith("'"))
+		) {
+			value = value.slice(1, -1);
+		}
+		return value || null;
+	}
+
+	/** Link from the metadata cache, or from disk when that cache has not caught up. */
+	private async readSceneLink(file: TFile): Promise<string | null> {
+		const cache = this.app.metadataCache.getFileCache(file);
+		const frontmatter = this.getFrontmatter(cache);
+		const cached = frontmatter?.['Link'];
+		if (typeof cached === 'string' && cached.trim()) {
+			return cached.trim();
+		}
+		try {
+			return this.linkFromNoteContent(await this.app.vault.cachedRead(file));
+		} catch {
+			return null;
+		}
+	}
+
+	/** Notes for this Discord thread, including same-titled notes the cache has not indexed yet. */
+	private async notesLinkedToThread(threadId: string, title: string, cached: TFile[]): Promise<TFile[]> {
+		const found = new Map<string, TFile>();
+		for (const file of cached) {
+			found.set(file.path, file);
+		}
+		for (const file of this.getSceneFiles()) {
+			if (found.has(file.path) || !this.noteMatchesSceneTitle(file, title)) {
+				continue;
+			}
+			const link = await this.readSceneLink(file);
+			if (link && this.extractThreadIdFromUrl(link) === threadId) {
+				found.set(file.path, file);
+			}
+		}
+		return [...found.values()];
 	}
 
 	// ========= NEW COMMAND METHODS =========
